@@ -366,6 +366,8 @@ func TestIntegrationDeletedLegacyS3ObjectStaysDeletedAfterConsoleList(t *testing
 			bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
 			seedRows(t, bucket.ID, time.Now().Add(-time.Hour), "legacy")
 			consoleHandler := NewBucketHandler(cfg)
+			importDone := make(chan struct{})
+			consoleHandler.reconcileImportDone = func() { close(importDone) }
 			console := itRouter(admin)
 			console.DELETE("/buckets/:name/objects/*key", consoleHandler.DeleteObject)
 			console.GET("/buckets/:name/objects", consoleHandler.ListObjects)
@@ -393,12 +395,13 @@ func TestIntegrationDeletedLegacyS3ObjectStaysDeletedAfterConsoleList(t *testing
 				t.Fatalf("deleted object retained current metadata: %v", got)
 			}
 			listed := listObjectsKeys(t, console, bucket.Name)
-			// A listed key is imported asynchronously. Wait for that import to
-			// persist before asserting, without a timing-dependent fixed sleep.
-			if len(listed) != 0 {
-				waitFor(t, "deleted legacy key imported by reconciliation", func() bool {
-					return len(rowKeys(t, bucket.ID)) != 0
-				})
+			// The observer fires only after this request's import job has
+			// finished, or synchronously when no job was scheduled. The DB
+			// assertion therefore cannot pass ahead of a hidden async import.
+			select {
+			case <-importDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("listing import did not finish")
 			}
 			if rows := rowKeys(t, bucket.ID); len(listed) != 0 || len(rows) != 0 {
 				t.Errorf("deleted legacy object was resurrected by console listing: listed=%v rows=%v", listed, rows)
