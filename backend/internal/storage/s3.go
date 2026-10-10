@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 // S3Storage implements StorageBackend using S3-compatible storage
@@ -148,6 +149,52 @@ func (s3s *S3Storage) DeleteBucket(bucketName string) error {
 	}
 
 	return nil
+}
+
+// IsS3BucketNotEmpty reports an upstream BucketNotEmpty refusal. The
+// caller may reclaim unreferenced bytes only after checking its metadata has
+// no live objects, content versions, or in-progress uploads.
+func IsS3BucketNotEmpty(err error) bool {
+	var apiErr smithy.APIError
+	return s3HTTPStatus(err) == 409 && errors.As(err, &apiErr) && apiErr.ErrorCode() == "BucketNotEmpty"
+}
+
+// EmptyBucket removes physical keys, including BKT's reserved generation and
+// version prefixes. Callers must first prove that no metadata still refers to
+// bytes in this bucket. Starting each page from the beginning avoids skipping
+// keys when deletions change the listing between requests.
+func (s3s *S3Storage) EmptyBucket(bucketName string) error {
+	actualBucketName := s3s.getBucketName(bucketName)
+	previousFirstKey := ""
+	for {
+		ctx, cancel := s3MetaCtx()
+		page, err := s3s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket: aws.String(actualBucketName), MaxKeys: aws.Int32(1000),
+		})
+		cancel()
+		if err != nil {
+			return fmt.Errorf("list bucket before emptying: %w", err)
+		}
+		if len(page.Contents) == 0 {
+			return nil
+		}
+		firstKey := aws.ToString(page.Contents[0].Key)
+		if firstKey == previousFirstKey {
+			return fmt.Errorf("bucket listing did not advance after deleting %q", firstKey)
+		}
+		previousFirstKey = firstKey
+		for _, object := range page.Contents {
+			key := aws.ToString(object.Key)
+			ctx, cancel := s3MetaCtx()
+			_, err := s3s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+				Bucket: aws.String(actualBucketName), Key: aws.String(key),
+			})
+			cancel()
+			if err != nil {
+				return fmt.Errorf("delete unreferenced bucket object %q: %w", key, err)
+			}
+		}
+	}
 }
 
 // BucketExists checks if a bucket exists and is accessible in S3

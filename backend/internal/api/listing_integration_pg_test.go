@@ -545,3 +545,65 @@ func TestIntegrationDeleteBucketDoesNotCommitAfterS3StorageRefusesDeletion(t *te
 		t.Errorf("failed bucket deletion touched object bytes: object DELETEs=%d bucket DELETEs=%d", objectDeletes, bucketDeletes)
 	}
 }
+
+func TestIntegrationDeleteBucketClearsUnreferencedS3Generations(t *testing.T) {
+	cfg := itConfig(t)
+	orphan := ".bkt-generations/old/" + uuid.NewString()
+	var mu sync.Mutex
+	physical := map[string]bool{orphan: true}
+	var bucketDeletes, objectDeletes int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		parts := strings.SplitN(strings.Trim(r.URL.Path, "/"), "/", 2)
+		switch {
+		case r.Method == http.MethodHead:
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2":
+			w.Header().Set("Content-Type", "application/xml")
+			if physical[orphan] {
+				_, _ = fmt.Fprintf(w, `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Contents><Key>%s</Key><Size>1</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>`, orphan)
+			} else {
+				_, _ = w.Write([]byte(`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListBucketResult>`))
+			}
+		case r.Method == http.MethodDelete && len(parts) == 2:
+			objectDeletes++
+			delete(physical, parts[1])
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodDelete:
+			bucketDeletes++
+			if len(physical) != 0 {
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`<Error><Code>BucketNotEmpty</Code></Error>`))
+			} else {
+				w.WriteHeader(http.StatusNoContent)
+			}
+		default:
+			w.WriteHeader(http.StatusNotImplemented)
+		}
+	}))
+	defer upstream.Close()
+	cfg.Storage.S3.Endpoint = strings.TrimPrefix(upstream.URL, "http://")
+	cfg.Storage.S3.Region = "us-east-1"
+	cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.SecretAccessKey = "AK", "SK"
+	cfg.Storage.S3.ForcePathStyle = true
+
+	admin := mkUser(t, itName("bucket-orphan"), "password-123", true, false)
+	bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+	router := itRouter(admin)
+	router.DELETE("/buckets/:name", NewBucketHandler(cfg).DeleteBucket)
+	deleted := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil)
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete bucket with unreferenced generation: %d %s", deleted.Code, deleted.Body.String())
+	}
+	var remaining int64
+	if err := database.DB.Model(&models.Bucket{}).Where("id = ?", bucket.ID).Count(&remaining).Error; err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if remaining != 0 || len(physical) != 0 || objectDeletes != 1 || bucketDeletes != 2 {
+		t.Errorf("orphan cleanup: bucket rows=%d physical=%v object DELETEs=%d bucket DELETEs=%d", remaining, physical, objectDeletes, bucketDeletes)
+	}
+}

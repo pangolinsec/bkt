@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+	"github.com/aws/smithy-go"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
@@ -17,6 +18,27 @@ func respErr(status int) error {
 		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
 		Err:      errors.New(http.StatusText(status)),
 	}}
+}
+
+func TestIsS3BucketNotEmptyRequiresErrorCode(t *testing.T) {
+	response := func(status int, code string) error {
+		return &awshttp.ResponseError{ResponseError: &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
+			Err:      &smithy.GenericAPIError{Code: code},
+		}}
+	}
+	if !IsS3BucketNotEmpty(response(http.StatusConflict, "BucketNotEmpty")) {
+		t.Error("BucketNotEmpty refusal should allow guarded orphan cleanup")
+	}
+	for _, err := range []error{
+		response(http.StatusConflict, "OperationAborted"),
+		response(http.StatusForbidden, "BucketNotEmpty"),
+		respErr(http.StatusConflict),
+	} {
+		if IsS3BucketNotEmpty(err) {
+			t.Errorf("unrelated upstream refusal allowed orphan cleanup: %v", err)
+		}
+	}
 }
 
 func TestClassifyMoveDestinationHead(t *testing.T) {

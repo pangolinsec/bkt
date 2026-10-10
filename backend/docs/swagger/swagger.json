@@ -646,7 +646,7 @@
                         "BearerAuth": []
                     }
                 ],
-                "description": "Admin-only. Local buckets are deleted with their contents. S3-backed buckets must be emptied first so an upstream refusal cannot delete live object bytes before the database commit.",
+                "description": "Admin-only. Local buckets are deleted with their contents. S3-backed buckets must have no live objects or versions; unreferenced physical blobs are cleaned up before deletion.",
                 "consumes": [
                     "application/json"
                 ],

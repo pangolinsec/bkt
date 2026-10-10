@@ -682,9 +682,9 @@ type adminBucketView struct {
 	Permissions   *bucketPermissionsView `json:"permissions,omitempty"`
 }
 
-// DeleteBucket deletes a bucket. S3-backed buckets must already be empty.
+// DeleteBucket deletes a bucket. S3-backed buckets must have no live objects.
 // @Summary Delete a bucket
-// @Description Admin-only. Local buckets are deleted with their contents. S3-backed buckets must be emptied first so an upstream refusal cannot delete live object bytes before the database commit.
+// @Description Admin-only. Local buckets are deleted with their contents. S3-backed buckets must have no live objects or versions; unreferenced physical blobs are cleaned up before deletion.
 // @Tags buckets
 // @Accept json
 // @Produce json
@@ -777,16 +777,47 @@ func (h *BucketHandler) DeleteBucket(c *gin.Context) {
 		return
 	}
 
-	// S3's own DeleteBucket checks whether the bucket is empty. Do not remove
-	// any referenced object bytes before that check: a later refusal (for
-	// example, because an orphan generation is still present) would leave live
-	// metadata pointing at deleted bytes. S3 buckets must be emptied first.
+	// S3's own DeleteBucket checks whether the bucket is physically empty.
+	// Never sweep it while metadata still references bytes: a later refusal
+	// would otherwise leave live rows pointing at deleted generations. When
+	// only unreferenced blobs remain, they can be removed safely and the
+	// upstream delete retried under this bucket's exclusive lock.
 	// Local storage can remove its entire directory after the DB commit, which
 	// keeps legacy bytes readable if that commit rolls back.
 	if bucket.StorageBackend == "s3" {
 		if err := storageBackend.DeleteBucket(bucketName); err != nil {
-			c.JSON(http.StatusConflict, models.ErrorResponse{Error: "Failed to delete bucket from storage", Message: err.Error()})
-			return
+			if !storage.IsS3BucketNotEmpty(err) {
+				c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to delete bucket from storage", Message: err.Error()})
+				return
+			}
+			var contentVersions, activeUploads int64
+			if err := database.DB.Model(&models.ObjectVersion{}).
+				Where("bucket_id = ? AND is_delete_marker = false", bucket.ID).Count(&contentVersions).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to check bucket versions", Message: err.Error()})
+				return
+			}
+			if err := database.DB.Model(&models.MultipartUpload{}).
+				Where("bucket_name = ? AND status = ?", bucket.Name, "in-progress").Count(&activeUploads).Error; err != nil {
+				c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to check bucket uploads", Message: err.Error()})
+				return
+			}
+			if len(objects) != 0 || contentVersions != 0 || activeUploads != 0 {
+				c.JSON(http.StatusConflict, models.ErrorResponse{Error: "Bucket is not empty", Message: "Delete objects, versions, and in-progress uploads before deleting this S3 bucket"})
+				return
+			}
+			s3Backend, ok := storageBackend.(*storage.S3Storage)
+			if !ok {
+				c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to empty S3 bucket"})
+				return
+			}
+			if err := s3Backend.EmptyBucket(bucketName); err != nil {
+				c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to empty S3 bucket", Message: err.Error()})
+				return
+			}
+			if err := storageBackend.DeleteBucket(bucketName); err != nil {
+				c.JSON(http.StatusConflict, models.ErrorResponse{Error: "Failed to delete bucket from storage", Message: err.Error()})
+				return
+			}
 		}
 	}
 
@@ -799,6 +830,9 @@ func (h *BucketHandler) DeleteBucket(c *gin.Context) {
 		}
 		if err := tx.Where("bucket_id = ?", bucket.ID).Delete(&models.Object{}).Error; err != nil {
 			return fmt.Errorf("failed to delete objects: %w", err)
+		}
+		if err := tx.Where("bucket_name = ?", bucket.Name).Delete(&models.MultipartUpload{}).Error; err != nil {
+			return fmt.Errorf("failed to delete multipart upload records: %w", err)
 		}
 
 		// Delete any bucket policies
