@@ -227,22 +227,23 @@ func lockObjectIDsChecked(ctx context.Context, ids []string) (func(), error) {
 }
 
 func unlockAdvisory(conn *sql.Conn, holds []advisoryHold) {
-	failed := false
+	// Request cancellation must not skip cleanup, but a disconnected or
+	// stalled database must not pin the local semaphore and advisory pool
+	// connection indefinitely either. One deadline covers every held lock.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 	for i := len(holds) - 1; i >= 0; i-- {
 		query := "SELECT pg_advisory_unlock($1)"
 		if holds[i].shared {
 			query = "SELECT pg_advisory_unlock_shared($1)"
 		}
 		var released bool
-		if err := conn.QueryRowContext(context.Background(), query, holds[i].key).Scan(&released); err != nil || !released {
-			failed = true
+		if err := conn.QueryRowContext(ctx, query, holds[i].key).Scan(&released); err != nil || !released {
 			logger.Warn("Failed to release object write advisory lock", map[string]interface{}{"error": fmt.Sprintf("err=%v released=%v", err, released)})
+			// A session with an unknown hold must never return to the pool.
+			discardAdvisoryConn(conn)
+			return
 		}
-	}
-	if failed {
-		// A session with an unreleased advisory lock must never be returned to
-		// the pool, where its next user would inherit that lock.
-		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
 	}
 }
 
@@ -258,6 +259,13 @@ func validateLockedBuckets(ctx context.Context, buckets ...*models.Bucket) error
 		}
 	}
 	return nil
+}
+
+// refreshLockedBucket discards configuration read before an advisory wait.
+// Callers must already hold the exclusive bucket lock before making decisions
+// about retention, versioning, storage routing, or deletion.
+func refreshLockedBucket(ctx context.Context, bucket *models.Bucket) error {
+	return database.DB.WithContext(ctx).Where("id = ? AND name = ?", bucket.ID, bucket.Name).First(bucket).Error
 }
 
 func lockObjectKeysChecked(ctx context.Context, bucket *models.Bucket, keys ...string) (func(), error) {
