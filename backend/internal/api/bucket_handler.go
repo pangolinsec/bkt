@@ -1647,12 +1647,15 @@ func (h *BucketHandler) limitMultipartBody(c *gin.Context) bool {
 	return true
 }
 
-// storeObject writes a console upload (sync or async) as the new current
-// version of key: per-key lock, quota reservation, versioned archive, byte
-// write (length/quota verified before commit), then an atomic metadata
-// upsert — rolling everything back if any step fails. It returns the stored
-// row, or an HTTP status and error.
+// storeObject writes a console upload (sync or async) into a private immutable
+// generation, then publishes the current pointer and prior-version row in one
+// database transaction. An interrupted write leaves only an orphan stage;
+// the previously committed bytes and metadata stay readable.
 func (h *BucketHandler) storeObject(ctx context.Context, backend storage.StorageBackend, bucket *models.Bucket, key string, data io.Reader, size int64, contentType, sha256Hex string) (*models.Object, int, error) {
+	generationBackend, ok := backend.(storage.GenerationStorage)
+	if !ok {
+		return nil, http.StatusInternalServerError, fmt.Errorf("storage backend does not support immutable generations")
+	}
 	unlock, lockErr := lockObjectKeysChecked(ctx, bucket, key)
 	if lockErr != nil {
 		return nil, http.StatusInternalServerError, lockErr
@@ -1665,8 +1668,6 @@ func (h *BucketHandler) storeObject(ctx context.Context, backend storage.Storage
 	}
 	defer reservation.release()
 
-	hadPrior := currentObjectExists(bucket.ID, key)
-
 	// Stream sources are verified (exact length, size cap, quota) before the
 	// backend sees their last byte. A seekable source is a server-side temp
 	// file of known size (async uploads); it is passed through as-is so the
@@ -1678,50 +1679,44 @@ func (h *BucketHandler) storeObject(ctx context.Context, backend storage.Storage
 		src = body
 	}
 
-	archivedVID, err := prepareVersionedWrite(backend, bucket, key)
-	if err != nil {
-		return nil, http.StatusInternalServerError, err
-	}
-	putErr := backend.PutObject(bucket.Name, key, src, size, contentType, nil)
+	generationID := uuid.NewString()
+	info, putErr := generationBackend.PutGeneration(bucket.Name, key, generationID, src, size, contentType, nil)
 	if putErr != nil || (body != nil && !body.Complete()) {
 		if putErr == nil {
 			// The backend reported success without consuming the verified
 			// body: treat the bytes as uncommitted.
-			discardFailedWrite(backend, bucket, key, archivedVID, hadPrior)
+			_ = generationBackend.DeleteGeneration(bucket.Name, key, generationID)
 			return nil, http.StatusInternalServerError, fmt.Errorf("storage backend did not consume the full upload")
 		}
-		rollbackVersionedWrite(backend, bucket, key, archivedVID)
-		if berr := body.Err(); berr != nil {
-			var qe *quotaExceededError
-			switch {
-			case errors.As(berr, &qe):
-				return nil, http.StatusForbidden, qe
-			case errors.Is(berr, errBodyTooLarge):
-				return nil, http.StatusRequestEntityTooLarge, berr
-			default:
-				return nil, http.StatusBadRequest, berr
+		if body != nil {
+			if berr := body.Err(); berr != nil {
+				var qe *quotaExceededError
+				switch {
+				case errors.As(berr, &qe):
+					return nil, http.StatusForbidden, qe
+				case errors.Is(berr, errBodyTooLarge):
+					return nil, http.StatusRequestEntityTooLarge, berr
+				default:
+					return nil, http.StatusBadRequest, berr
+				}
 			}
 		}
 		return nil, http.StatusInternalServerError, putErr
 	}
 
-	info, err := backend.GetObjectInfo(bucket.Name, key)
-	if err != nil {
-		discardFailedWrite(backend, bucket, key, archivedVID, hadPrior)
-		return nil, http.StatusInternalServerError, fmt.Errorf("failed to get object info: %w", err)
-	}
 	obj := &models.Object{
-		BucketID:    bucket.ID,
-		Key:         key,
-		Size:        info.Size,
-		ContentType: contentType,
-		ETag:        info.ETag,
-		SHA256:      sha256Hex,
-		StoragePath: key,
-		VersionID:   newCurrentVersionID(bucket),
+		BucketID:     bucket.ID,
+		Key:          key,
+		Size:         info.Size,
+		ContentType:  contentType,
+		ETag:         info.ETag,
+		SHA256:       sha256Hex,
+		StoragePath:  key,
+		GenerationID: generationID,
+		VersionID:    newCurrentVersionID(bucket),
 	}
-	if err := upsertCurrentObject(obj); err != nil {
-		discardFailedWrite(backend, bucket, key, archivedVID, hadPrior)
+	generationCommitBoundary("console")
+	if err := commitStagedGeneration(generationBackend, bucket, obj); err != nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("failed to save object metadata: %w", err)
 	}
 	return obj, http.StatusOK, nil

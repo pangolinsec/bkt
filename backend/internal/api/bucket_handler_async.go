@@ -272,8 +272,8 @@ func (h *BucketHandler) UploadObjectAsync(c *gin.Context) {
 
 // processAsyncUpload processes the upload in the background. It uses the
 // same commit path as the synchronous upload (storeObject): per-key lock,
-// quota reservation, versioned archive, write, and an atomic metadata upsert
-// with a fresh version id — rolling back if any step fails.
+// quota reservation, immutable generation staging, and one transaction for
+// the current pointer and prior-version row.
 func (h *BucketHandler) processAsyncUpload(uploadID uuid.UUID, tempFilePath string, bucketID uuid.UUID) {
 	// Ensure temp file is cleaned up
 	defer func() {

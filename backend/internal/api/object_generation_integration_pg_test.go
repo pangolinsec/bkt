@@ -1,14 +1,18 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"testing"
+	"time"
 
 	"bkt/internal/config"
 	"bkt/internal/database"
@@ -71,6 +75,8 @@ func generationCrashChild(t *testing.T) bool {
 		}
 		body := []byte(fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, part.Header().Get("ETag")))
 		itDo(s3, http.MethodPost, "/"+bucketName+"/dest?uploadId="+upload.UploadId, body)
+	case "console":
+		consoleUpload(t, itConsoleRouter(cfg, owner), bucketName, "dest", "new-bytes")
 	default:
 		t.Fatalf("unknown crash mode %q", mode)
 	}
@@ -108,6 +114,125 @@ func TestIntegrationGenerationCrashMultipart(t *testing.T) {
 	}
 	if status, body := s3GetString(t, router, bucket.Name, "dest"); status != http.StatusOK || body != "new-bytes" {
 		t.Errorf("retried multipart bytes: %d %q", status, body)
+	}
+}
+
+func TestIntegrationGenerationCrashConsoleUpload(t *testing.T) {
+	if generationCrashChild(t) {
+		return
+	}
+	cfg, _, bucket, router := generationFixture(t)
+	s3PutString(t, router, bucket.Name, "dest", "old-bytes")
+	before := itDo(router, http.MethodHead, "/"+bucket.Name+"/dest", nil)
+	runGenerationCrash(t, cfg, bucket.Name, "console", "")
+	after := itDo(router, http.MethodGet, "/"+bucket.Name+"/dest", nil)
+	if after.Code != http.StatusOK || after.Body.String() != "old-bytes" || after.Header().Get("ETag") != before.Header().Get("ETag") {
+		t.Errorf("console crash exposed uncommitted bytes: status=%d body=%q ETag=%q committed ETag=%q",
+			after.Code, after.Body.String(), after.Header().Get("ETag"), before.Header().Get("ETag"))
+	}
+}
+
+func TestIntegrationConsoleUploadPublishesGenerationAndHistory(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-console-upload"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) { b.Versioning = models.VersioningEnabled })
+	s3 := itS3Router(cfg, owner)
+	s3PutString(t, s3, bucket.Name, "key", "old-bytes")
+	var old models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&old).Error; err != nil {
+		t.Fatal(err)
+	}
+	consoleUpload(t, itConsoleRouter(cfg, owner), bucket.Name, "key", "new-bytes")
+	var current models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&current).Error; err != nil {
+		t.Fatal(err)
+	}
+	if current.GenerationID == "" || current.GenerationID == old.GenerationID {
+		t.Fatalf("console upload did not publish a new generation: old=%q current=%q", old.GenerationID, current.GenerationID)
+	}
+	if status, body := s3GetString(t, s3, bucket.Name, "key"); status != http.StatusOK || body != "new-bytes" {
+		t.Errorf("console current bytes: %d %q", status, body)
+	}
+	var archived models.ObjectVersion
+	if err := database.DB.Where("bucket_id = ? AND key = ? AND version_id = ?", bucket.ID, "key", old.VersionID).First(&archived).Error; err != nil || archived.GenerationID != old.GenerationID {
+		t.Fatalf("console upload lost old version: %+v %v", archived, err)
+	}
+	if w := itDo(s3, http.MethodGet, "/"+bucket.Name+"/key?versionId="+old.VersionID, nil); w.Code != http.StatusOK || w.Body.String() != "old-bytes" {
+		t.Errorf("console previous version bytes: %d %q", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegrationAsyncConsoleUploadPublishesGenerationAndHistory(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-console-async"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) { b.Versioning = models.VersioningEnabled })
+	s3 := itS3Router(cfg, owner)
+	s3PutString(t, s3, bucket.Name, "key", "old-bytes")
+	var old models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&old).Error; err != nil {
+		t.Fatal(err)
+	}
+	console := itConsoleRouter(cfg, owner)
+	handler := NewBucketHandler(cfg)
+	console.POST("/api/buckets/:name/objects/async", handler.UploadObjectAsync)
+	console.GET("/api/uploads/:id/status", handler.GetUploadStatus)
+	var form bytes.Buffer
+	mw := multipart.NewWriter(&form)
+	if err := mw.WriteField("key", "key"); err != nil {
+		t.Fatal(err)
+	}
+	fw, err := mw.CreateFormFile("file", "upload.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = fw.Write([]byte("new-bytes"))
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/buckets/"+bucket.Name+"/objects/async", &form)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	w := httptest.NewRecorder()
+	console.ServeHTTP(w, req)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("async init: %d %s", w.Code, w.Body.String())
+	}
+	var init struct {
+		UploadID string `json:"upload_id"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &init); err != nil || init.UploadID == "" {
+		t.Fatalf("async init response: %+v %v", init, err)
+	}
+	t.Cleanup(func() { database.DB.Where("id = ?", init.UploadID).Delete(&models.Upload{}) })
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		status := itDo(console, http.MethodGet, "/api/uploads/"+init.UploadID+"/status", nil)
+		if status.Code != http.StatusOK {
+			t.Fatalf("async status: %d %s", status.Code, status.Body.String())
+		}
+		var state models.UploadStatusResponse
+		if err := json.Unmarshal(status.Body.Bytes(), &state); err != nil {
+			t.Fatal(err)
+		}
+		if state.Status == models.UploadStatusCompleted {
+			break
+		}
+		if state.Status == models.UploadStatusFailed || time.Now().After(deadline) {
+			t.Fatalf("async generation upload never completed: %+v", state)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	var current models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&current).Error; err != nil {
+		t.Fatal(err)
+	}
+	if current.GenerationID == "" || current.GenerationID == old.GenerationID || current.SHA256 == "" {
+		t.Fatalf("async upload missing new generation or hash: old=%+v current=%+v", old, current)
+	}
+	if status, body := s3GetString(t, s3, bucket.Name, "key"); status != http.StatusOK || body != "new-bytes" {
+		t.Errorf("async current bytes: %d %q", status, body)
+	}
+	if v := itDo(s3, http.MethodGet, "/"+bucket.Name+"/key?versionId="+old.VersionID, nil); v.Code != http.StatusOK || v.Body.String() != "old-bytes" {
+		t.Errorf("async previous version bytes: %d %q", v.Code, v.Body.String())
 	}
 }
 
