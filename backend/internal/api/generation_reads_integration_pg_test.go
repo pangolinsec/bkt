@@ -65,3 +65,39 @@ func TestIntegrationGenerationPointersResolveCurrentRangeConsoleAndHistory(t *te
 		t.Errorf("historical generation: %d %q", w.Code, w.Body.String())
 	}
 }
+
+func TestIntegrationS3PutCommitsImmutableCurrentAndHistory(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-write"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) { b.Versioning = models.VersioningEnabled })
+	router := itS3Router(cfg, owner)
+	s3PutString(t, router, bucket.Name, "key", "first")
+	var first models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&first).Error; err != nil {
+		t.Fatal(err)
+	}
+	if first.GenerationID == "" {
+		t.Fatal("first PUT did not commit an immutable generation")
+	}
+	s3PutString(t, router, bucket.Name, "key", "second")
+	var second models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&second).Error; err != nil {
+		t.Fatal(err)
+	}
+	if second.GenerationID == "" || second.GenerationID == first.GenerationID {
+		t.Errorf("second PUT did not publish a distinct generation: first=%q second=%q", first.GenerationID, second.GenerationID)
+	}
+	var archived models.ObjectVersion
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&archived).Error; err != nil {
+		t.Fatal(err)
+	}
+	if archived.GenerationID != first.GenerationID {
+		t.Errorf("archived pointer = %q, want %q", archived.GenerationID, first.GenerationID)
+	}
+	if status, body := s3GetString(t, router, bucket.Name, "key"); status != http.StatusOK || body != "second" {
+		t.Errorf("current bytes: %d %q", status, body)
+	}
+	if w := itDo(router, http.MethodGet, "/"+bucket.Name+"/key?versionId="+archived.VersionID, nil); w.Code != http.StatusOK || w.Body.String() != "first" {
+		t.Errorf("archived bytes: %d %q", w.Code, w.Body.String())
+	}
+}
