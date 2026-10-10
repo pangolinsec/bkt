@@ -641,6 +641,53 @@ func (h *S3APIHandler) checkWritePreconditions(c *gin.Context, bucket *models.Bu
 	return exists, true
 }
 
+// checkCopySourcePreconditions evaluates the source's copy-specific headers
+// against the metadata loaded under the source key lock. S3 gives a matching
+// source ETag priority over an older If-Unmodified-Since date.
+func (h *S3APIHandler) checkCopySourcePreconditions(c *gin.Context, source *models.Object, key string) bool {
+	if condition := c.GetHeader("x-amz-copy-source-if-match"); condition != "" &&
+		!etagConditionMatches(condition, source.ETag, true) {
+		h.s3Error(c, "PreconditionFailed", "Source If-Match precondition failed", key, http.StatusPreconditionFailed)
+		return false
+	}
+	if condition := c.GetHeader("x-amz-copy-source-if-none-match"); condition != "" &&
+		etagConditionMatches(condition, source.ETag, true) {
+		h.s3Error(c, "PreconditionFailed", "Source If-None-Match precondition failed", key, http.StatusPreconditionFailed)
+		return false
+	}
+	modifiedAt := source.UpdatedAt.UTC().Truncate(time.Second)
+	for _, item := range []struct {
+		header string
+		match bool
+	}{
+		{"x-amz-copy-source-if-unmodified-since", false},
+		{"x-amz-copy-source-if-modified-since", true},
+	} {
+		value := c.GetHeader(item.header)
+		if value == "" {
+			continue
+		}
+		cutoff, err := http.ParseTime(value)
+		if err != nil {
+			h.s3Error(c, "InvalidArgument", "Invalid source condition date", key, http.StatusBadRequest)
+			return false
+		}
+		if !item.match && c.GetHeader("x-amz-copy-source-if-match") != "" {
+			// A matching source ETag wins over If-Unmodified-Since.
+			continue
+		}
+		valid := !modifiedAt.After(cutoff)
+		if item.match {
+			valid = modifiedAt.After(cutoff)
+		}
+		if !valid {
+			h.s3Error(c, "PreconditionFailed", "Source date precondition failed", key, http.StatusPreconditionFailed)
+			return false
+		}
+	}
+	return true
+}
+
 // PutObject handles PUT /{bucket}/{key+} (upload, copy, or multipart part)
 func (h *S3APIHandler) PutObject(c *gin.Context) {
 	// Unsupported sub-resources (?acl, ?retention, ?legal-hold, ...) and
@@ -1203,6 +1250,9 @@ func (h *S3APIHandler) CopyObject(c *gin.Context, copySource string) {
 	var srcObj models.Object
 	if err := database.DB.Where("bucket_id = ? AND key = ?", srcBucketModel.ID, srcKey).First(&srcObj).Error; err != nil {
 		h.s3Error(c, "NoSuchKey", "Source key does not exist", srcKey, http.StatusNotFound)
+		return
+	}
+	if !h.checkCopySourcePreconditions(c, &srcObj, srcKey) {
 		return
 	}
 
