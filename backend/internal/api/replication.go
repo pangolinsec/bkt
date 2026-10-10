@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"sort"
 	"sync"
@@ -321,12 +322,26 @@ func acrossBucketLockIDs(bucketA, keyA, bucketB, keyB string) []string {
 	return ids
 }
 
-func lockKeysAcrossBucketsChecked(bucketA, keyA, bucketB, keyB string) (func(), error) {
-	return lockObjectIDsChecked(acrossBucketLockIDs(bucketA, keyA, bucketB, keyB))
+func lockKeysAcrossBucketsChecked(ctx context.Context, bucketA *models.Bucket, keyA string, bucketB *models.Bucket, keyB string) (func(), error) {
+	unlock, err := lockObjectIDsChecked(ctx, acrossBucketLockIDs(bucketA.Name, keyA, bucketB.Name, keyB))
+	if err != nil {
+		return nil, err
+	}
+	if err := validateLockedBuckets(ctx, bucketA, bucketB); err != nil {
+		unlock()
+		return nil, err
+	}
+	return unlock, nil
 }
 
-func tryLockKeysAcrossBucketsChecked(bucketA, keyA, bucketB, keyB string, timeout time.Duration) (func(), bool) {
-	return tryLockObjectIDsChecked(acrossBucketLockIDs(bucketA, keyA, bucketB, keyB), timeout)
+func tryLockKeysAcrossBucketsChecked(bucketA *models.Bucket, keyA string, bucketB *models.Bucket, keyB string, timeout time.Duration) (func(), bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	unlock, err := lockKeysAcrossBucketsChecked(ctx, bucketA, keyA, bucketB, keyB)
+	if err != nil {
+		return func() {}, false
+	}
+	return unlock, true
 }
 
 // tryLockKeysAcrossBuckets is lockKeysAcrossBuckets with a deadline covering
@@ -366,7 +381,7 @@ func tryLockKeysAcrossBuckets(bucketA, keyA, bucketB, keyB string, timeout time.
 // Reports whether a copy was committed, and whether the keys were busy (lock
 // not acquired within sweepLockTimeout; retried next sweep).
 func replicateObject(srcBackend, dstBackend storage.StorageBackend, src, dst *models.Bucket, key string) (copied, busy bool) {
-	unlock, ok := tryLockKeysAcrossBucketsChecked(src.Name, key, dst.Name, key, sweepLockTimeout)
+	unlock, ok := tryLockKeysAcrossBucketsChecked(src, key, dst, key, sweepLockTimeout)
 	if !ok {
 		return false, true
 	}
@@ -434,7 +449,7 @@ func replicateObjectLocked(srcBackend, dstBackend storage.StorageBackend, src, d
 // history — including retained data — is kept. Reports whether it removed,
 // and whether the key was busy (retried next sweep).
 func mirrorDelete(dstBackend storage.StorageBackend, src, dst *models.Bucket, key string) (removed, busy bool) {
-	unlock, ok := tryLockObjectKeysChecked(dst.Name, sweepLockTimeout, key)
+	unlock, ok := tryLockObjectKeysChecked(dst, sweepLockTimeout, key)
 	if !ok {
 		return false, true
 	}

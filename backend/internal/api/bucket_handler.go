@@ -724,6 +724,16 @@ func (h *BucketHandler) DeleteBucket(c *gin.Context) {
 		return
 	}
 
+	// Object mutations hold a shared advisory lock on the bucket for their
+	// full write/commit sequence. Deletion takes the exclusive side before it
+	// enumerates or removes bytes, so no replica can write through this sweep.
+	unlockBucket, lockErr := lockBucketExclusive(c.Request.Context(), &bucket)
+	if lockErr != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to lock bucket", Message: lockErr.Error()})
+		return
+	}
+	defer unlockBucket()
+
 	// Get storage backend for this bucket
 	storageBackend, err := h.getStorageBackend(&bucket)
 	if err != nil {
@@ -1253,7 +1263,7 @@ func (h *BucketHandler) ListObjects(c *gin.Context) {
 				// listing — so a row being overwritten right now (bytes briefly
 				// absent between archive and write) is never pruned.
 				if len(plan.stale) > 0 {
-					go pruneStaleObjectRows(bucketName, plan.stale)
+					go pruneStaleObjectRows(&bucket, plan.stale)
 				}
 
 				// Keep the page's non-stale rows plus the imported ones.
@@ -1349,9 +1359,9 @@ func planReconcilePrune(rows []models.Object, listed map[string]storage.ObjectIn
 // backend. Each delete runs under the key's write lock (skipped if the lock is
 // busy) and only matches the row as it was listed (same id and updated_at),
 // so a concurrent overwrite, delete or move of the key always wins.
-func pruneStaleObjectRows(bucketName string, stale []models.Object) {
+func pruneStaleObjectRows(bucket *models.Bucket, stale []models.Object) {
 	for _, obj := range stale {
-		unlock, ok := tryLockObjectKeysChecked(bucketName, reconcilePruneLockWait, obj.Key)
+		unlock, ok := tryLockObjectKeysChecked(bucket, reconcilePruneLockWait, obj.Key)
 		if !ok {
 			continue
 		}
@@ -1359,7 +1369,7 @@ func pruneStaleObjectRows(bucketName string, stale []models.Object) {
 		unlock()
 		if res.Error != nil {
 			logger.Warn("Failed to prune stale object row", map[string]interface{}{
-				"bucket": bucketName, "key": obj.Key, "error": res.Error.Error(),
+				"bucket": bucket.Name, "key": obj.Key, "error": res.Error.Error(),
 			})
 		}
 	}
@@ -1550,7 +1560,7 @@ func (h *BucketHandler) UploadObject(c *gin.Context) {
 	}
 	resultChan := make(chan uploadResult, 1)
 	go func() {
-		obj, status, err := h.storeObject(storageBackend, &bucket, objectKey, body, fileHeader.Size, contentType, "")
+		obj, status, err := h.storeObject(ctx, storageBackend, &bucket, objectKey, body, fileHeader.Size, contentType, "")
 		resultChan <- uploadResult{obj: obj, status: status, err: err}
 	}()
 
@@ -1638,8 +1648,8 @@ func (h *BucketHandler) limitMultipartBody(c *gin.Context) bool {
 // write (length/quota verified before commit), then an atomic metadata
 // upsert — rolling everything back if any step fails. It returns the stored
 // row, or an HTTP status and error.
-func (h *BucketHandler) storeObject(backend storage.StorageBackend, bucket *models.Bucket, key string, data io.Reader, size int64, contentType, sha256Hex string) (*models.Object, int, error) {
-	unlock, lockErr := lockObjectKeysChecked(bucket.Name, key)
+func (h *BucketHandler) storeObject(ctx context.Context, backend storage.StorageBackend, bucket *models.Bucket, key string, data io.Reader, size int64, contentType, sha256Hex string) (*models.Object, int, error) {
+	unlock, lockErr := lockObjectKeysChecked(ctx, bucket, key)
 	if lockErr != nil {
 		return nil, http.StatusInternalServerError, lockErr
 	}
@@ -1889,7 +1899,7 @@ func (h *BucketHandler) DeleteObject(c *gin.Context) {
 
 	// Serialize with other writers of this key (archive/delete must not
 	// interleave with an overwrite).
-	unlock, lockErr := lockObjectKeysChecked(bucketName, objectKey)
+	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), &bucket, objectKey)
 	if lockErr != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to lock object"})
 		return
@@ -2134,7 +2144,7 @@ func (h *BucketHandler) moveSingleObject(c *gin.Context, srcKey, dstKey, success
 		return
 	}
 
-	unlock, lockErr := lockObjectKeysChecked(bucketName, srcKey, dstKey)
+	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), &bucket, srcKey, dstKey)
 	if lockErr != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to lock objects"})
 		return
@@ -2428,7 +2438,7 @@ func (h *BucketHandler) MoveFolder(c *gin.Context) {
 	// them, so rather than queueing behind a slow upload of one key (while
 	// blocking every other writer of the keys already acquired) it gives up
 	// and asks the client to retry.
-	unlock, locked := tryLockObjectKeysChecked(bucketName, folderMoveLockTimeout, lockKeys...)
+	unlock, locked := tryLockObjectKeysChecked(&bucket, folderMoveLockTimeout, lockKeys...)
 	if !locked {
 		c.JSON(http.StatusConflict, models.ErrorResponse{
 			Error:   "Objects busy",

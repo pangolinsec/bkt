@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -202,7 +203,7 @@ func (h *BucketHandler) DeleteFolder(c *gin.Context) {
 
 	deleted, skippedRetention, eventsSent := 0, 0, 0
 	for _, key := range allowedKeys {
-		removed, retained, derr := deleteCurrentObjectLocked(backend, &bucket, key)
+		removed, retained, derr := deleteCurrentObjectLocked(c.Request.Context(), backend, &bucket, key)
 		if derr != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error":             "Failed to delete folder",
@@ -248,8 +249,8 @@ func (h *BucketHandler) DeleteFolder(c *gin.Context) {
 // bucket archives the bytes and records a delete marker; otherwise the delete
 // is permanent and WORM retention forbids it (retained=true). removed=false
 // with no error means the key no longer had a current version.
-func deleteCurrentObjectLocked(backend storage.StorageBackend, bucket *models.Bucket, key string) (removed, retained bool, err error) {
-	unlock, lockErr := lockObjectKeysChecked(bucket.Name, key)
+func deleteCurrentObjectLocked(ctx context.Context, backend storage.StorageBackend, bucket *models.Bucket, key string) (removed, retained bool, err error) {
+	unlock, lockErr := lockObjectKeysChecked(ctx, bucket, key)
 	if lockErr != nil {
 		return false, false, lockErr
 	}
