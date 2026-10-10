@@ -62,6 +62,7 @@ const (
 // LocalStorage implements StorageBackend using local filesystem
 type LocalStorage struct {
 	rootPath string
+	syncDir  func(string) error // nil uses syncLocalDirectory; tests inject failures
 }
 
 // NewLocalStorage creates a new local storage backend
@@ -311,7 +312,9 @@ func (ls *LocalStorage) CreateBucket(bucketName, region string) error {
 }
 
 // DeleteBucket removes a bucket's objects and archived versions, including
-// anything left in the legacy (pre-blob-layout) locations.
+// anything left in the legacy (pre-blob-layout) locations. It syncs each
+// parent directory after removal before callers may clear durable cleanup
+// metadata: otherwise a power loss could resurrect the bucket name.
 func (ls *LocalStorage) DeleteBucket(bucketName string) error {
 	if err := checkBucketName(bucketName); err != nil {
 		return err
@@ -326,8 +329,34 @@ func (ls *LocalStorage) DeleteBucket(bucketName string) error {
 		if err := os.RemoveAll(p); err != nil && firstErr == nil {
 			firstErr = fmt.Errorf("failed to delete bucket directory: %w", err)
 		}
+		parent := filepath.Dir(p)
+		if _, err := os.Stat(parent); err != nil {
+			if os.IsNotExist(err) && parent != filepath.Clean(ls.rootPath) {
+				continue // this layout's parent never existed
+			}
+			if firstErr == nil {
+				firstErr = fmt.Errorf("failed to stat bucket parent directory: %w", err)
+			}
+			continue
+		}
+		syncDir := ls.syncDir
+		if syncDir == nil {
+			syncDir = syncLocalDirectory
+		}
+		if err := syncDir(parent); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("failed to sync bucket parent directory: %w", err)
+		}
 	}
 	return firstErr
+}
+
+func syncLocalDirectory(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 // BucketExists reports whether the bucket has a directory, in the blob layout
