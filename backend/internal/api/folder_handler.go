@@ -249,7 +249,10 @@ func (h *BucketHandler) DeleteFolder(c *gin.Context) {
 // is permanent and WORM retention forbids it (retained=true). removed=false
 // with no error means the key no longer had a current version.
 func deleteCurrentObjectLocked(backend storage.StorageBackend, bucket *models.Bucket, key string) (removed, retained bool, err error) {
-	unlock := lockObjectKeys(bucket.Name, key)
+	unlock, lockErr := lockObjectKeysChecked(bucket.Name, key)
+	if lockErr != nil {
+		return false, false, lockErr
+	}
 	defer unlock()
 
 	var obj models.Object
