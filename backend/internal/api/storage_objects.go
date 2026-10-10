@@ -364,6 +364,14 @@ func tryLockObjectKeys(bucketName string, timeout time.Duration, keys ...string)
 // back, so a caller that treats an error as "not committed" and discards the
 // written bytes can never leave a row pointing at deleted bytes.
 func upsertCurrentObject(obj *models.Object) error {
+	return database.DB.Transaction(func(tx *gorm.DB) error {
+		return upsertCurrentObjectInTx(tx, obj)
+	})
+}
+
+// upsertCurrentObjectInTx permits a generation pointer and its archived
+// predecessor to become visible in the same transaction.
+func upsertCurrentObjectInTx(tx *gorm.DB, obj *models.Object) error {
 	now := time.Now()
 	if obj.CreatedAt.IsZero() {
 		obj.CreatedAt = now
@@ -373,27 +381,19 @@ func upsertCurrentObject(obj *models.Object) error {
 		obj.StoragePath = obj.Key
 	}
 	var stored models.Object
-	err := database.DB.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Clauses(clause.OnConflict{
-			Columns: []clause.Column{{Name: "bucket_id"}, {Name: "key"}},
-			DoUpdates: clause.AssignmentColumns([]string{
-				"size", "content_type", "content_disposition", "cache_control", "e_tag", "sha256", "storage_path", "generation_id",
-				"metadata", "tags", "version_id", "updated_at",
-			}),
-		}).Create(obj).Error; err != nil {
-			return err
-		}
-		// Reload into a fresh struct: obj.ID was assigned by BeforeCreate
-		// and, on the conflict-update path, is not the stored row's id —
-		// First(obj) would add "id = <that id>" to the WHERE clause and find
-		// nothing.
-		if err := tx.Where("bucket_id = ? AND key = ?", obj.BucketID, obj.Key).First(&stored).Error; err != nil {
-			return fmt.Errorf("reload committed object row: %w", err)
-		}
-		return nil
-	})
-	if err != nil {
+	if err := tx.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "bucket_id"}, {Name: "key"}},
+		DoUpdates: clause.AssignmentColumns([]string{
+			"size", "content_type", "content_disposition", "cache_control", "e_tag", "sha256", "storage_path", "generation_id",
+			"metadata", "tags", "version_id", "updated_at",
+		}),
+	}).Create(obj).Error; err != nil {
 		return err
+	}
+	// Reload into a fresh struct: obj.ID was assigned by BeforeCreate and,
+	// on the conflict-update path, is not the stored row's id.
+	if err := tx.Where("bucket_id = ? AND key = ?", obj.BucketID, obj.Key).First(&stored).Error; err != nil {
+		return fmt.Errorf("reload committed object row: %w", err)
 	}
 	*obj = stored
 	return nil

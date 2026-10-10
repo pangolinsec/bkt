@@ -434,7 +434,6 @@ func (h *S3APIHandler) GetObject(c *gin.Context) {
 		h.s3Error(c, "InternalError", "Failed to initialize storage", objectKey, http.StatusInternalServerError)
 		return
 	}
-
 	// Common S3-compatible headers
 	c.Header("Content-Type", object.ContentType)
 	c.Header("ETag", fmt.Sprintf(`"%s"`, object.ETag))
@@ -808,6 +807,12 @@ func (h *S3APIHandler) PutObject(c *gin.Context) {
 		return
 	}
 
+	generationBackend, ok := storageBackend.(storage.GenerationStorage)
+	if !ok {
+		h.s3Error(c, "InternalError", "Storage does not support immutable generations", objectKey, http.StatusInternalServerError)
+		return
+	}
+
 	// Serialize with other writers of this key: archive → write → metadata
 	// must not interleave with a concurrent overwrite or delete.
 	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), &bucket, objectKey)
@@ -816,7 +821,7 @@ func (h *S3APIHandler) PutObject(c *gin.Context) {
 		return
 	}
 	defer unlock()
-	hadPrior, ok := h.checkWritePreconditions(c, &bucket, objectKey)
+	_, ok = h.checkWritePreconditions(c, &bucket, objectKey)
 	if !ok {
 		return
 	}
@@ -836,21 +841,16 @@ func (h *S3APIHandler) PutObject(c *gin.Context) {
 	// commit an unverified or truncated body.
 	body := newGuardedBody(combinedReader, contentLength, h.config.Storage.MaxFileSize, reservation)
 
-	// Versioning: archive the current version before overwriting.
-	archivedVID, verr := prepareVersionedWrite(storageBackend, &bucket, objectKey)
-	if verr != nil {
-		h.s3Error(c, "InternalError", "Failed to version existing object", objectKey, http.StatusInternalServerError)
-		return
-	}
-
-	err = storageBackend.PutObject(bucketName, objectKey, body, contentLength, contentType, userMeta)
+	// A create-only blob is durable before its pointer is made visible. A
+	// failed DB commit leaves a reclaimable orphan, never a changed live key.
+	generationID := uuid.NewString()
+	objectInfo, err := generationBackend.PutGeneration(bucketName, objectKey, generationID, body, contentLength, contentType, userMeta)
 	if err != nil || !body.Complete() {
 		if err == nil {
-			discardFailedWrite(storageBackend, &bucket, objectKey, archivedVID, hadPrior)
+			_ = generationBackend.DeleteGeneration(bucketName, objectKey, generationID)
 			h.s3Error(c, "InternalError", "Failed to save object", objectKey, http.StatusInternalServerError)
 			return
 		}
-		rollbackVersionedWrite(storageBackend, &bucket, objectKey, archivedVID)
 		if code, msg, status, ok := bodyFailure(body); ok {
 			h.s3Error(c, code, msg, objectKey, status)
 			return
@@ -859,15 +859,7 @@ func (h *S3APIHandler) PutObject(c *gin.Context) {
 		return
 	}
 
-	// Get object info (including ETag)
-	objectInfo, err := storageBackend.GetObjectInfo(bucketName, objectKey)
-	if err != nil {
-		discardFailedWrite(storageBackend, &bucket, objectKey, archivedVID, hadPrior)
-		h.s3Error(c, "InternalError", "Failed to get object info", objectKey, http.StatusInternalServerError)
-		return
-	}
-
-	// Record the new current version atomically (upsert).
+	// Publish the current pointer and prior-version row in one DB commit.
 	object := models.Object{
 		BucketID:           bucket.ID,
 		Key:                objectKey,
@@ -877,12 +869,12 @@ func (h *S3APIHandler) PutObject(c *gin.Context) {
 		CacheControl:       c.GetHeader("Cache-Control"),
 		ETag:               objectInfo.ETag,
 		StoragePath:        objectKey,
+		GenerationID:       generationID,
 		Metadata:           mapToJSONPtr(userMeta),
 		Tags:               mapToJSONPtr(objTags),
 		VersionID:          newCurrentVersionID(&bucket),
 	}
-	if err := upsertCurrentObject(&object); err != nil {
-		discardFailedWrite(storageBackend, &bucket, objectKey, archivedVID, hadPrior)
+	if err := commitStagedGeneration(generationBackend, &bucket, &object); err != nil {
 		h.s3Error(c, "InternalError", "Failed to save object metadata", objectKey, http.StatusInternalServerError)
 		return
 	}
