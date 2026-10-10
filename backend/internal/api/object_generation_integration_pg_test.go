@@ -251,6 +251,10 @@ func TestIntegrationDeleteBucketKeepsLegacyBytesWhenMetadataCommitFails(t *testi
 	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "legacy").First(&current).Error; err != nil {
 		t.Fatalf("metadata should roll back with bucket delete: %v", err)
 	}
+	var pending int64
+	if err := database.DB.Model(&models.LocalBucketCleanup{}).Where("id = ?", bucket.ID).Count(&pending).Error; err != nil || pending != 0 {
+		t.Fatalf("cleanup record must roll back with bucket delete: count=%d err=%v", pending, err)
+	}
 	rc, err := backend.GetObject(bucket.Name, "legacy")
 	if err != nil {
 		t.Fatalf("live legacy bytes were deleted before metadata commit: %v", err)

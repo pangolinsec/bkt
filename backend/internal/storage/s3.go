@@ -2,6 +2,9 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,9 +24,10 @@ import (
 
 // S3Storage implements StorageBackend using S3-compatible storage
 type S3Storage struct {
-	client       *s3.Client
-	bucketPrefix string
-	sse          bool // request SSE-S3 (AES256) on every write
+	client        *s3.Client
+	bucketPrefix  string
+	routeIdentity string
+	sse           bool // request SSE-S3 (AES256) on every write
 }
 
 // NewS3Storage creates a new S3 storage backend
@@ -54,11 +58,25 @@ func NewS3Storage(endpoint, region, accessKeyID, secretAccessKey, bucketPrefix s
 	})
 
 	return &S3Storage{
-		client:       client,
-		bucketPrefix: bucketPrefix,
-		sse:          sse,
+		client:        client,
+		bucketPrefix:  bucketPrefix,
+		routeIdentity: S3RouteIdentity(endpoint, region, accessKeyID, secretAccessKey, bucketPrefix, useSSL, forcePathStyle),
+		sse:           sse,
 	}, nil
 }
+
+// S3RouteIdentity fingerprints every setting that can change which upstream
+// bucket/account receives a destructive request. It does not store credentials.
+func S3RouteIdentity(endpoint, region, accessKeyID, secretAccessKey, bucketPrefix string, useSSL, forcePathStyle bool) string {
+	encoded, _ := json.Marshal(struct {
+		Endpoint, Region, AccessKeyID, SecretAccessKey, BucketPrefix string
+		UseSSL, ForcePathStyle                                       bool
+	}{endpoint, region, accessKeyID, secretAccessKey, bucketPrefix, useSSL, forcePathStyle})
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+func (s3s *S3Storage) RouteIdentity() string { return s3s.routeIdentity }
 
 // Upstream call deadlines. Non-streaming calls (HEAD, DELETE, list pages,
 // multipart bookkeeping) get s3MetadataTimeout so a hung upstream cannot pin a

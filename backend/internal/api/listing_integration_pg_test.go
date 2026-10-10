@@ -1,23 +1,103 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"bkt/internal/config"
 	"bkt/internal/database"
 	"bkt/internal/models"
+	"bkt/internal/storage"
 
 	"github.com/google/uuid"
 )
+
+func pinTestS3Route(t *testing.T, cfg *config.Config, bucket *models.Bucket) {
+	t.Helper()
+	bucket.S3RouteIdentity = storage.S3RouteIdentity(cfg.Storage.S3.Endpoint, cfg.Storage.S3.Region,
+		cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.SecretAccessKey, cfg.Storage.S3.BucketPrefix,
+		cfg.Storage.S3.UseSSL, cfg.Storage.S3.ForcePathStyle)
+	if err := database.DB.Model(bucket).Update("s3_route_identity", bucket.S3RouteIdentity).Error; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestIntegrationLocalBucketCleanupSurvivesFilesystemFailure(t *testing.T) {
+	cfg := itConfig(t)
+	admin := mkUser(t, itName("local-cleanup"), "password-123", true, false)
+	bucket := itBucket(t, admin.ID, nil)
+	backend := storage.NewLocalStorage(cfg.Storage.RootPath)
+	if err := backend.PutObject(bucket.Name, "orphan", bytes.NewReader([]byte("private-bytes")), 13, "text/plain", nil); err != nil {
+		t.Fatal(err)
+	}
+	originalRemove := removeLocalBucket
+	removeLocalBucket = func(rootPath, name string) error { return errors.New("injected filesystem failure") }
+	t.Cleanup(func() {
+		removeLocalBucket = originalRemove
+		database.DB.Where("name = ?", bucket.Name).Delete(&models.LocalBucketCleanup{})
+	})
+	router := itRouter(admin)
+	h := NewBucketHandler(cfg)
+	router.DELETE("/buckets/:name", h.DeleteBucket)
+	router.POST("/buckets", h.CreateBucket)
+	if got := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil); got.Code != http.StatusInternalServerError {
+		t.Fatalf("filesystem failure: %d %s", got.Code, got.Body.String())
+	}
+	var bucketRows, cleanupRows int64
+	database.DB.Model(&models.Bucket{}).Where("id = ?", bucket.ID).Count(&bucketRows)
+	database.DB.Model(&models.LocalBucketCleanup{}).Where("name = ?", bucket.Name).Count(&cleanupRows)
+	if bucketRows != 0 || cleanupRows != 1 {
+		t.Fatalf("durable cleanup state: bucket=%d cleanup=%d", bucketRows, cleanupRows)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.RootPath, ".objects", bucket.Name)); err != nil {
+		t.Fatalf("bytes not preserved: %v", err)
+	}
+	create := []byte(`{"name":"` + bucket.Name + `","storage_backend":"local"}`)
+	if got := itDo(router, http.MethodPost, "/buckets", create); got.Code != http.StatusConflict {
+		t.Fatalf("create linked orphaned bytes: %d %s", got.Code, got.Body.String())
+	}
+	removeLocalBucket = originalRemove
+	marker := filepath.Join(cfg.Storage.RootPath, localRootIdentityFile)
+	originalID, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte(uuid.NewString()), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReconcileLocalBucketCleanups(cfg.Storage.RootPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.RootPath, ".objects", bucket.Name)); err != nil {
+		t.Fatalf("changed volume identity removed bytes: %v", err)
+	}
+	if err := os.WriteFile(marker, originalID, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReconcileLocalBucketCleanups(cfg.Storage.RootPath); err != nil {
+		t.Fatal(err)
+	}
+	database.DB.Model(&models.LocalBucketCleanup{}).Where("name = ?", bucket.Name).Count(&cleanupRows)
+	if cleanupRows != 0 {
+		t.Fatalf("cleanup record not cleared: %d", cleanupRows)
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Storage.RootPath, ".objects", bucket.Name)); !os.IsNotExist(err) {
+		t.Fatalf("orphaned bytes survived retry: %v", err)
+	}
+}
 
 // Postgres-gated integration tests for the listing paths: S3
 // ListObjectVersions pagination and the S3-backed ListObjects reconcile.
@@ -524,6 +604,7 @@ func TestIntegrationDeleteBucketDoesNotCommitAfterS3StorageRefusesDeletion(t *te
 
 	admin := mkUser(t, itName("bucket-delete"), "password-123", true, false)
 	bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+	pinTestS3Route(t, cfg, &bucket)
 	seedRows(t, bucket.ID, time.Now().Add(-time.Hour), "generated")
 	if err := database.DB.Model(&models.Object{}).Where("bucket_id = ? AND key = ?", bucket.ID, "generated").
 		Update("generation_id", uuid.NewString()).Error; err != nil {
@@ -594,6 +675,7 @@ func TestIntegrationDeleteBucketClearsUnreferencedS3Generations(t *testing.T) {
 
 	admin := mkUser(t, itName("bucket-orphan"), "password-123", true, false)
 	bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+	pinTestS3Route(t, cfg, &bucket)
 	router := itRouter(admin)
 	router.DELETE("/buckets/:name", NewBucketHandler(cfg).DeleteBucket)
 	deleted := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil)
@@ -671,6 +753,7 @@ func TestIntegrationDeleteBucketRefusesPublicKeysAndNativeVersioning(t *testing.
 			cfg.Storage.S3.ForcePathStyle = true
 			admin := mkUser(t, itName("bucket-refuse"), "password-123", true, false)
 			bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+			pinTestS3Route(t, cfg, &bucket)
 			router := itRouter(admin)
 			router.DELETE("/buckets/:name", NewBucketHandler(cfg).DeleteBucket)
 			deleted := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil)
@@ -688,7 +771,7 @@ func TestIntegrationDeleteBucketRefusesPublicKeysAndNativeVersioning(t *testing.
 	}
 }
 
-func TestIntegrationDeleteBucketRetriesAfterMetadataCommitFailure(t *testing.T) {
+func TestIntegrationDeleteBucketKeepsMetadataWhenRetryFindsNoSuchBucket(t *testing.T) {
 	cfg := itConfig(t)
 	var bucketDeletes int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -715,6 +798,7 @@ func TestIntegrationDeleteBucketRetriesAfterMetadataCommitFailure(t *testing.T) 
 	cfg.Storage.S3.ForcePathStyle = true
 	admin := mkUser(t, itName("bucket-retry"), "password-123", true, false)
 	bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+	pinTestS3Route(t, cfg, &bucket)
 	if err := database.DB.Exec(`CREATE FUNCTION bkt_test_block_bucket_delete() RETURNS trigger AS $$
 		BEGIN RAISE EXCEPTION 'injected bucket delete failure'; END;
 		$$ LANGUAGE plpgsql`).Error; err != nil {
@@ -734,14 +818,59 @@ func TestIntegrationDeleteBucketRetriesAfterMetadataCommitFailure(t *testing.T) 
 	if err := database.DB.Exec("DROP TRIGGER bkt_test_block_bucket_delete ON buckets").Error; err != nil {
 		t.Fatal(err)
 	}
-	if retried := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil); retried.Code != http.StatusOK {
-		t.Fatalf("retry after upstream removal: %d %s", retried.Code, retried.Body.String())
+	if retried := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil); retried.Code != http.StatusInternalServerError {
+		t.Fatalf("NoSuchBucket must keep metadata for routing investigation: %d %s", retried.Code, retried.Body.String())
 	}
 	var remaining int64
 	if err := database.DB.Model(&models.Bucket{}).Where("id = ?", bucket.ID).Count(&remaining).Error; err != nil {
 		t.Fatal(err)
 	}
-	if remaining != 0 || bucketDeletes != 2 {
-		t.Errorf("retry did not reconcile metadata: bucket rows=%d upstream DELETEs=%d", remaining, bucketDeletes)
+	if remaining != 1 || bucketDeletes != 2 {
+		t.Errorf("NoSuchBucket removed metadata: bucket rows=%d upstream DELETEs=%d", remaining, bucketDeletes)
+	}
+}
+
+func TestIntegrationDeleteBucketChangedEndpointCannotDeleteWrongEmptyBucket(t *testing.T) {
+	cfg := itConfig(t)
+	cfg.Storage.S3.Endpoint = "original.invalid"
+	cfg.Storage.S3.Region = "us-east-1"
+	cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.SecretAccessKey = "AK", "SK"
+	cfg.Storage.S3.ForcePathStyle = true
+	admin := mkUser(t, itName("changed-endpoint"), "password-123", true, false)
+	bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+	pinTestS3Route(t, cfg, &bucket)
+	var upstreamDeletes int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			upstreamDeletes++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotImplemented)
+	}))
+	defer upstream.Close()
+	cfg.Storage.S3.Endpoint = strings.TrimPrefix(upstream.URL, "http://")
+	router := itRouter(admin)
+	router.DELETE("/buckets/:name", NewBucketHandler(cfg).DeleteBucket)
+	if got := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil); got.Code != http.StatusConflict {
+		t.Fatalf("changed route accepted: %d %s", got.Code, got.Body.String())
+	}
+	var remaining int64
+	if err := database.DB.Model(&models.Bucket{}).Where("id = ?", bucket.ID).Count(&remaining).Error; err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 1 || upstreamDeletes != 0 {
+		t.Fatalf("changed route touched upstream or metadata: rows=%d deletes=%d", remaining, upstreamDeletes)
+	}
+}
+
+func TestIntegrationDeleteBucketLegacyRouteRefused(t *testing.T) {
+	cfg := itConfig(t)
+	admin := mkUser(t, itName("legacy-route"), "password-123", true, false)
+	bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+	router := itRouter(admin)
+	router.DELETE("/buckets/:name", NewBucketHandler(cfg).DeleteBucket)
+	if got := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil); got.Code != http.StatusConflict {
+		t.Fatalf("legacy unpinned route accepted: %d %s", got.Code, got.Body.String())
 	}
 }

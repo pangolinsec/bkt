@@ -99,6 +99,9 @@ func main() {
 	if err := storage.MigrateLocalLayout(cfg.Storage.RootPath); err != nil {
 		log.Fatalf("Local storage layout migration failed (resumable: fix the cause and restart): %v", err)
 	}
+	if err := api.ReconcileLocalBucketCleanups(cfg.Storage.RootPath); err != nil {
+		log.Fatalf("Local bucket cleanup failed (resumable: fix the cause and restart): %v", err)
+	}
 
 	// Start Prometheus storage metrics collector (runs every 60s)
 	metrics.StartStorageMetricsCollector()

@@ -146,6 +146,7 @@ func runMigrations(db *gorm.DB) error {
 		&models.AccessKey{},
 		&models.S3Configuration{},
 		&models.Bucket{},
+		&models.LocalBucketCleanup{},
 		&models.Object{},
 		&models.Policy{},
 		&models.BucketPolicy{},
