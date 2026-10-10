@@ -151,6 +151,153 @@ func TestIntegrationDeleteBucketReloadsRetentionAfterLockWait(t *testing.T) {
 	}
 }
 
+func TestIntegrationDeleteObjectReloadsRetentionAfterSharedLockWait(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("object-retention"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) { b.Versioning = models.VersioningEnabled })
+	router := itS3Router(cfg, owner)
+	router.DELETE("/:bucket/*key", NewS3APIHandler(cfg).DeleteObject)
+	s3PutString(t, router, bucket.Name, "held", "retained bytes")
+	var current models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "held").First(&current).Error; err != nil {
+		t.Fatal(err)
+	}
+	if current.VersionID == "" {
+		t.Fatal("expected a versioned current object")
+	}
+	conn, err := database.AdvisoryDB.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := advisoryBucketKey(bucket.Name)
+	if _, err := conn.ExecContext(context.Background(), "SELECT pg_advisory_lock($1)", key); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	release := func() {
+		if _, err := conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", key); err != nil {
+			t.Error(err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Error(err)
+		}
+	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- itDo(router, http.MethodDelete, "/"+bucket.Name+"/held?versionId="+current.VersionID, nil)
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting int64
+		err := database.DB.Raw(`SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'SELECT pg_advisory_lock_shared(%'`).Scan(&waiting).Error
+		if err != nil {
+			release()
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			break
+		}
+		select {
+		case w := <-done:
+			release()
+			t.Fatalf("DELETE completed before shared bucket lock: %d %s", w.Code, w.Body.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			release()
+			t.Fatal("DELETE never waited for shared bucket lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := database.DB.Model(&models.Bucket{}).Where("id = ?", bucket.ID).Update("retention_days", 30).Error; err != nil {
+		release()
+		t.Fatal(err)
+	}
+	release()
+	select {
+	case w := <-done:
+		if w.Code != http.StatusForbidden {
+			t.Errorf("DELETE after retention raised: %d %s, want 403", w.Code, w.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("DELETE did not complete after lock released")
+	}
+	if status, body := s3GetString(t, router, bucket.Name, "held"); status != http.StatusOK || body != "retained bytes" {
+		t.Errorf("retained object: status=%d body=%q", status, body)
+	}
+}
+
+func TestIntegrationCrossBucketLockRefreshesBothBuckets(t *testing.T) {
+	itConfig(t)
+	owner := mkUser(t, itName("cross-refresh"), "password-123", true, false)
+	source := itBucket(t, owner.ID, nil)
+	target := itBucket(t, owner.ID, nil)
+	conn, err := database.AdvisoryDB.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := advisoryBucketKey(target.Name)
+	if _, err := conn.ExecContext(context.Background(), "SELECT pg_advisory_lock($1)", key); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	release := func() {
+		if _, err := conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", key); err != nil {
+			t.Error(err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Error(err)
+		}
+	}
+	done := make(chan error, 1)
+	go func() {
+		unlock, err := lockKeysAcrossBucketsChecked(context.Background(), &source, "src", &target, "dst")
+		if err == nil {
+			unlock()
+		}
+		done <- err
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting int64
+		err := database.DB.Raw(`SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'SELECT pg_advisory_lock_shared(%'`).Scan(&waiting).Error
+		if err != nil {
+			release()
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			break
+		}
+		select {
+		case err := <-done:
+			release()
+			t.Fatalf("cross-bucket lock completed before release: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			release()
+			t.Fatal("cross-bucket writer did not wait")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := database.DB.Model(&models.Bucket{}).Where("id = ?", target.ID).Update("quota_bytes", 1234).Error; err != nil {
+		release()
+		t.Fatal(err)
+	}
+	release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("cross-bucket writer did not complete")
+	}
+	if target.QuotaBytes != 1234 {
+		t.Errorf("target config after lock wait = %d, want 1234", target.QuotaBytes)
+	}
+}
+
 type gateBody struct {
 	data    []byte
 	entered chan struct{}
