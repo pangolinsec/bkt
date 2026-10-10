@@ -159,7 +159,13 @@ func (h *S3APIHandler) CreateMultipartUpload(c *gin.Context) {
 		return
 	}
 
-	uploadID, err := storageBackend.CreateMultipartUpload(bucketName, objectKey, contentType, userMeta)
+	generationID := uuid.NewString()
+	var uploadID string
+	if s3Backend, ok := storageBackend.(*storage.S3Storage); ok {
+		uploadID, err = s3Backend.CreateGenerationMultipartUpload(bucketName, objectKey, generationID, contentType, userMeta)
+	} else {
+		uploadID, err = storageBackend.CreateMultipartUpload(bucketName, objectKey, contentType, userMeta)
+	}
 	if err != nil {
 		h.s3Error(c, "InternalError", "Failed to create multipart upload", objectKey, http.StatusInternalServerError)
 		return
@@ -171,6 +177,7 @@ func (h *S3APIHandler) CreateMultipartUpload(c *gin.Context) {
 		UserID:             userUUID,
 		BucketName:         bucketName,
 		ObjectKey:          objectKey,
+		GenerationID:       generationID,
 		ContentType:        contentType,
 		ContentDisposition: c.GetHeader("Content-Disposition"),
 		CacheControl:       c.GetHeader("Cache-Control"),
@@ -181,7 +188,11 @@ func (h *S3APIHandler) CreateMultipartUpload(c *gin.Context) {
 	if err := database.DB.Create(&mpu).Error; err != nil {
 		// Without the tracking row every later op on this uploadId would 404,
 		// so don't hand out an unusable id — clean up the staging area and fail.
-		_ = storageBackend.AbortMultipartUpload(bucketName, objectKey, uploadID)
+		if s3Backend, ok := storageBackend.(*storage.S3Storage); ok {
+			_ = s3Backend.AbortGenerationMultipartUpload(bucketName, objectKey, generationID, uploadID)
+		} else {
+			_ = storageBackend.AbortMultipartUpload(bucketName, objectKey, uploadID)
+		}
 		h.s3Error(c, "InternalError", "Failed to record multipart upload", objectKey, http.StatusInternalServerError)
 		return
 	}
@@ -287,7 +298,16 @@ func (h *S3APIHandler) UploadPart(c *gin.Context) {
 	}
 	body := newGuardedBody(upload.reader, upload.declared, h.config.Storage.MaxFileSize, nil)
 
-	etag, err := storageBackend.UploadPart(mpu.BucketName, mpu.ObjectKey, uploadID, partNumber, body, upload.declared)
+	var etag string
+	if s3Backend, ok := storageBackend.(*storage.S3Storage); ok {
+		if mpu.GenerationID == "" {
+			h.s3Error(c, "NoSuchUpload", "Legacy multipart upload must be restarted", uploadID, http.StatusNotFound)
+			return
+		}
+		etag, err = s3Backend.UploadGenerationPart(mpu.BucketName, mpu.ObjectKey, mpu.GenerationID, uploadID, partNumber, body, upload.declared)
+	} else {
+		etag, err = storageBackend.UploadPart(mpu.BucketName, mpu.ObjectKey, uploadID, partNumber, body, upload.declared)
+	}
 	if err != nil || !body.Complete() {
 		if code, msg, status, ok := bodyFailure(body); ok {
 			h.s3Error(c, code, msg, objectKey, status)
@@ -365,7 +385,16 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 	// Local listings are free and keep the precise InvalidPart error.
 	var assembledSize int64
 	if bucket.QuotaBytes > 0 || bucket.StorageBackend != "s3" {
-		partSizes, err := storage.PartSizes(storageBackend, mpu.BucketName, mpu.ObjectKey, uploadID)
+		var partSizes map[int]int64
+		if s3Backend, ok := storageBackend.(*storage.S3Storage); ok {
+			if mpu.GenerationID == "" {
+				h.s3Error(c, "NoSuchUpload", "Legacy multipart upload must be restarted", uploadID, http.StatusNotFound)
+				return
+			}
+			partSizes, err = s3Backend.GenerationPartSizes(mpu.BucketName, mpu.ObjectKey, mpu.GenerationID, uploadID)
+		} else {
+			partSizes, err = storage.PartSizes(storageBackend, mpu.BucketName, mpu.ObjectKey, uploadID)
+		}
 		if err != nil {
 			h.s3Error(c, "InternalError", "Failed to list uploaded parts", uploadID, http.StatusInternalServerError)
 			return
@@ -395,8 +424,23 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 	if local, ok := storageBackend.(*storage.LocalStorage); ok {
 		// Local parts live in a private staging directory. Assemble directly
 		// into immutable storage so old readers retain their selected bytes.
-		generationID = uuid.NewString()
+		generationID = mpu.GenerationID
+		if generationID == "" { // in-flight local upload from before the additive column
+			generationID = uuid.NewString()
+		}
 		objInfo, err = local.CompleteMultipartGeneration(mpu.BucketName, mpu.ObjectKey, generationID, uploadID, parts)
+		if err != nil {
+			h.s3Error(c, "InternalError", "Failed to complete multipart upload", objectKey, http.StatusInternalServerError)
+			return
+		}
+		generationCommitBoundary("multipart")
+	} else if s3Backend, ok := storageBackend.(*storage.S3Storage); ok {
+		if mpu.GenerationID == "" {
+			h.s3Error(c, "NoSuchUpload", "Legacy multipart upload must be restarted", uploadID, http.StatusNotFound)
+			return
+		}
+		generationID = mpu.GenerationID
+		objInfo, err = s3Backend.CompleteGenerationMultipartUpload(mpu.BucketName, mpu.ObjectKey, generationID, uploadID, parts)
 		if err != nil {
 			h.s3Error(c, "InternalError", "Failed to complete multipart upload", objectKey, http.StatusInternalServerError)
 			return
@@ -485,7 +529,18 @@ func (h *S3APIHandler) AbortMultipartUpload(c *gin.Context) {
 		return
 	}
 
-	if err := storageBackend.AbortMultipartUpload(mpu.BucketName, mpu.ObjectKey, uploadID); err != nil {
+	if s3Backend, ok := storageBackend.(*storage.S3Storage); ok {
+		if mpu.GenerationID == "" {
+			// Old in-flight uploads cannot be safely completed, but their
+			// upstream parts can still be released by an explicit abort.
+			err = storageBackend.AbortMultipartUpload(mpu.BucketName, mpu.ObjectKey, uploadID)
+		} else {
+			err = s3Backend.AbortGenerationMultipartUpload(mpu.BucketName, mpu.ObjectKey, mpu.GenerationID, uploadID)
+		}
+	} else {
+		err = storageBackend.AbortMultipartUpload(mpu.BucketName, mpu.ObjectKey, uploadID)
+	}
+	if err != nil {
 		h.s3Error(c, "InternalError", "Failed to abort multipart upload", objectKey, http.StatusInternalServerError)
 		return
 	}
@@ -513,7 +568,16 @@ func (h *S3APIHandler) ListPartsHandler(c *gin.Context) {
 		return
 	}
 
-	parts, err := storageBackend.ListParts(mpu.BucketName, mpu.ObjectKey, uploadID)
+	var parts []storage.PartInfo
+	if s3Backend, ok := storageBackend.(*storage.S3Storage); ok {
+		if mpu.GenerationID == "" {
+			h.s3Error(c, "NoSuchUpload", "Legacy multipart upload must be restarted", uploadID, http.StatusNotFound)
+			return
+		}
+		parts, err = s3Backend.ListGenerationParts(mpu.BucketName, mpu.ObjectKey, mpu.GenerationID, uploadID)
+	} else {
+		parts, err = storageBackend.ListParts(mpu.BucketName, mpu.ObjectKey, uploadID)
+	}
 	if err != nil {
 		h.s3Error(c, "NoSuchUpload", "The specified upload does not exist", uploadID, http.StatusNotFound)
 		return
@@ -732,7 +796,16 @@ func (h *S3APIHandler) UploadPartCopy(c *gin.Context) {
 	}
 	defer partReader.Close() //nolint:errcheck // best-effort close of read stream
 
-	etag, err := destStorage.UploadPart(mpu.BucketName, mpu.ObjectKey, uploadID, partNumber, partReader, length)
+	var etag string
+	if s3Backend, ok := destStorage.(*storage.S3Storage); ok {
+		if mpu.GenerationID == "" {
+			h.s3Error(c, "NoSuchUpload", "Legacy multipart upload must be restarted", uploadID, http.StatusNotFound)
+			return
+		}
+		etag, err = s3Backend.UploadGenerationPart(mpu.BucketName, mpu.ObjectKey, mpu.GenerationID, uploadID, partNumber, partReader, length)
+	} else {
+		etag, err = destStorage.UploadPart(mpu.BucketName, mpu.ObjectKey, uploadID, partNumber, partReader, length)
+	}
 	if err != nil {
 		h.s3Error(c, "InternalError", "Failed to upload part", objectKey, http.StatusInternalServerError)
 		return

@@ -14,6 +14,7 @@ type MultipartUpload struct {
 	UserID             uuid.UUID `gorm:"type:uuid;index;not null" json:"user_id"`
 	BucketName         string    `gorm:"index;not null" json:"bucket_name"`
 	ObjectKey          string    `gorm:"not null" json:"object_key"`
+	GenerationID       string    `gorm:"not null;default:''" json:"-"` // hidden physical target for generation-aware uploads
 	ContentType        string    `json:"content_type"`
 	ContentDisposition string    `json:"content_disposition,omitempty"`
 	CacheControl       string    `json:"cache_control,omitempty"`

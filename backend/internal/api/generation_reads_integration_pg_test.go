@@ -3,8 +3,10 @@ package api
 import (
 	"encoding/xml"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +17,110 @@ import (
 
 	"github.com/google/uuid"
 )
+
+func TestIntegrationS3MultipartPublishesHiddenGeneration(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-s3-mpu"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) {
+		b.StorageBackend = "s3"
+		b.Versioning = models.VersioningEnabled
+	})
+	oldGenerationID, oldVersionID := uuid.NewString(), uuid.NewString()
+	if err := database.DB.Create(&models.Object{
+		BucketID: bucket.ID, Key: "key", Size: 3, ContentType: "text/plain",
+		ETag: "old-etag", StoragePath: "key", GenerationID: oldGenerationID, VersionID: oldVersionID,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	var hiddenPath string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/"+bucket.Name+"/.bkt-generations/") {
+			t.Errorf("multipart touched public physical key: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/"+oldGenerationID) {
+			if r.Method != http.MethodGet {
+				t.Errorf("unexpected old generation request: %s", r.Method)
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			w.Header().Set("ETag", `"old-etag"`)
+			_, _ = w.Write([]byte("old"))
+			return
+		}
+		if hiddenPath != "" && hiddenPath != r.URL.Path {
+			t.Errorf("generation key changed from %s to %s", hiddenPath, r.URL.Path)
+		}
+		hiddenPath = r.URL.Path
+		q, _ := url.ParseQuery(r.URL.RawQuery)
+		switch {
+		case r.Method == http.MethodPost && q.Has("uploads"):
+			_, _ = w.Write([]byte(`<InitiateMultipartUploadResult><UploadId>upstream-upload</UploadId></InitiateMultipartUploadResult>`))
+		case r.Method == http.MethodPut && q.Get("partNumber") == "1":
+			body, err := io.ReadAll(r.Body)
+			if err != nil || string(body) != "new" {
+				t.Errorf("part body: %q %v", body, err)
+			}
+			w.Header().Set("ETag", `"part-etag"`)
+		case r.Method == http.MethodPost && q.Get("uploadId") == "upstream-upload":
+			if r.Header.Get("If-None-Match") != "*" {
+				t.Error("multipart completion lacked create-only condition")
+			}
+			_, _ = w.Write([]byte(`<CompleteMultipartUploadResult><ETag>"committed-etag"</ETag></CompleteMultipartUploadResult>`))
+		case r.Method == http.MethodHead:
+			w.Header().Set("ETag", `"committed-etag"`)
+			w.Header().Set("Content-Length", "3")
+		case r.Method == http.MethodGet:
+			w.Header().Set("ETag", `"committed-etag"`)
+			_, _ = w.Write([]byte("new"))
+		default:
+			t.Errorf("unexpected upstream request: %s %s", r.Method, r.URL.RawQuery)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer upstream.Close()
+	cfg.Storage.S3.Endpoint = strings.TrimPrefix(upstream.URL, "http://")
+	cfg.Storage.S3.Region = "us-east-1"
+	cfg.Storage.S3.AccessKeyID = "fixture-access"
+	cfg.Storage.S3.SecretAccessKey = "fixture-secret"
+	cfg.Storage.S3.UseSSL = false
+	cfg.Storage.S3.ForcePathStyle = true
+	router := itS3Router(cfg, owner)
+	if status, body := s3GetString(t, router, bucket.Name, "key"); status != http.StatusOK || body != "old" {
+		t.Fatalf("prior generation read: %d %q", status, body)
+	}
+	start := itDo(router, http.MethodPost, "/"+bucket.Name+"/key?uploads", nil)
+	if start.Code != http.StatusOK {
+		t.Fatalf("init: %d %s", start.Code, start.Body.String())
+	}
+	var init InitiateMultipartUploadResult
+	if err := xml.Unmarshal(start.Body.Bytes(), &init); err != nil || init.UploadId != "upstream-upload" {
+		t.Fatalf("init XML: %+v %v", init, err)
+	}
+	part := itDo(router, http.MethodPut, "/"+bucket.Name+"/key?partNumber=1&uploadId="+init.UploadId, []byte("new"))
+	if part.Code != http.StatusOK {
+		t.Fatalf("part: %d %s", part.Code, part.Body.String())
+	}
+	complete := []byte(fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, part.Header().Get("ETag")))
+	if w := itDo(router, http.MethodPost, "/"+bucket.Name+"/key?uploadId="+init.UploadId, complete); w.Code != http.StatusOK {
+		t.Fatalf("complete: %d %s", w.Code, w.Body.String())
+	}
+	var current models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&current).Error; err != nil || current.GenerationID == "" || current.GenerationID == oldGenerationID {
+		t.Fatalf("current generation: %+v %v", current, err)
+	}
+	var archived models.ObjectVersion
+	if err := database.DB.Where("bucket_id = ? AND key = ? AND version_id = ?", bucket.ID, "key", oldVersionID).First(&archived).Error; err != nil || archived.GenerationID != oldGenerationID {
+		t.Fatalf("archived previous generation: %+v %v", archived, err)
+	}
+	if status, body := s3GetString(t, router, bucket.Name, "key"); status != http.StatusOK || body != "new" {
+		t.Errorf("committed generation read: %d %q", status, body)
+	}
+	if w := itDo(router, http.MethodGet, "/"+bucket.Name+"/key?versionId="+oldVersionID, nil); w.Code != http.StatusOK || w.Body.String() != "old" {
+		t.Errorf("archived generation read: %d %q", w.Code, w.Body.String())
+	}
+}
 
 func TestIntegrationGenerationPointersResolveCurrentRangeConsoleAndHistory(t *testing.T) {
 	cfg := itConfig(t)
