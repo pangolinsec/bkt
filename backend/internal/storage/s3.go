@@ -60,18 +60,18 @@ func NewS3Storage(endpoint, region, accessKeyID, secretAccessKey, bucketPrefix s
 	return &S3Storage{
 		client:        client,
 		bucketPrefix:  bucketPrefix,
-		routeIdentity: S3RouteIdentity(endpoint, region, accessKeyID, secretAccessKey, bucketPrefix, useSSL, forcePathStyle),
+		routeIdentity: S3RouteIdentity(endpoint, region, accessKeyID, bucketPrefix, useSSL, forcePathStyle),
 		sse:           sse,
 	}, nil
 }
 
-// S3RouteIdentity fingerprints every setting that can change which upstream
-// bucket/account receives a destructive request. It does not store credentials.
-func S3RouteIdentity(endpoint, region, accessKeyID, secretAccessKey, bucketPrefix string, useSSL, forcePathStyle bool) string {
+// S3RouteIdentity fingerprints the configured route and access-key identity.
+// Secret-key rotation for the same access key does not change the route.
+func S3RouteIdentity(endpoint, region, accessKeyID, bucketPrefix string, useSSL, forcePathStyle bool) string {
 	encoded, _ := json.Marshal(struct {
-		Endpoint, Region, AccessKeyID, SecretAccessKey, BucketPrefix string
-		UseSSL, ForcePathStyle                                       bool
-	}{endpoint, region, accessKeyID, secretAccessKey, bucketPrefix, useSSL, forcePathStyle})
+		Endpoint, Region, AccessKeyID, BucketPrefix string
+		UseSSL, ForcePathStyle                      bool
+	}{endpoint, region, accessKeyID, bucketPrefix, useSSL, forcePathStyle})
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
 }

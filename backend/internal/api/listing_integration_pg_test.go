@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -28,7 +30,7 @@ import (
 func pinTestS3Route(t *testing.T, cfg *config.Config, bucket *models.Bucket) {
 	t.Helper()
 	bucket.S3RouteIdentity = storage.S3RouteIdentity(cfg.Storage.S3.Endpoint, cfg.Storage.S3.Region,
-		cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.SecretAccessKey, cfg.Storage.S3.BucketPrefix,
+		cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.BucketPrefix,
 		cfg.Storage.S3.UseSSL, cfg.Storage.S3.ForcePathStyle)
 	if err := database.DB.Model(bucket).Update("s3_route_identity", bucket.S3RouteIdentity).Error; err != nil {
 		t.Fatal(err)
@@ -78,8 +80,8 @@ func TestIntegrationLocalBucketCleanupSurvivesFilesystemFailure(t *testing.T) {
 	if err := os.WriteFile(marker, []byte(uuid.NewString()), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := ReconcileLocalBucketCleanups(cfg.Storage.RootPath); err != nil {
-		t.Fatal(err)
+	if err := ReconcileLocalBucketCleanups(cfg.Storage.RootPath); err == nil {
+		t.Fatal("changed storage root identity was accepted")
 	}
 	if _, err := os.Stat(filepath.Join(cfg.Storage.RootPath, ".objects", bucket.Name)); err != nil {
 		t.Fatalf("changed volume identity removed bytes: %v", err)
@@ -97,6 +99,118 @@ func TestIntegrationLocalBucketCleanupSurvivesFilesystemFailure(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(cfg.Storage.RootPath, ".objects", bucket.Name)); !os.IsNotExist(err) {
 		t.Fatalf("orphaned bytes survived retry: %v", err)
 	}
+}
+
+func TestIntegrationConcurrentCleanupCannotRemoveRecreatedBucket(t *testing.T) {
+	cfg := itConfig(t)
+	admin := mkUser(t, itName("cleanup-race"), "password-123", true, false)
+	name := itName("cleanup-race-bucket")
+	root, err := filepath.Abs(cfg.Storage.RootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootID, err := ensureLocalRootIdentity(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := models.LocalBucketCleanup{ID: uuid.New(), Name: name, RootPath: root, RootIdentity: rootID}
+	if err := database.DB.Create(&entry).Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.DB.Where("id = ?", entry.ID).Delete(&models.LocalBucketCleanup{}) })
+	backend := storage.NewLocalStorage(root)
+	if err := backend.CreateBucket(name, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.PutObject(name, "old", bytes.NewReader([]byte("old")), 3, "text/plain", nil); err != nil {
+		t.Fatal(err)
+	}
+	originalRemove := removeLocalBucket
+	removed := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var removeCalls atomic.Int32
+	removeLocalBucket = func(rootPath, bucketName string) error {
+		call := removeCalls.Add(1)
+		if err := originalRemove(rootPath, bucketName); err != nil {
+			return err
+		}
+		if call == 1 {
+			close(removed)
+			<-release
+		}
+		return nil
+	}
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }); removeLocalBucket = originalRemove })
+	resultA := make(chan error, 1)
+	go func() { resultA <- ReconcileLocalBucketCleanups(root) }()
+	select {
+	case <-removed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first cleanup did not reach filesystem removal")
+	}
+	// New bytes arrive after A's physical sweep but before CreateBucket links
+	// the directory. A stale worker must not remove them after creation.
+	if err := backend.PutObject(name, "new", bytes.NewReader([]byte("new-bytes")), 9, "text/plain", nil); err != nil {
+		t.Fatal(err)
+	}
+	router := itRouter(admin)
+	router.POST("/buckets", NewBucketHandler(cfg).CreateBucket)
+	created := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		created <- itDo(router, http.MethodPost, "/buckets", []byte(`{"name":"`+name+`","storage_backend":"local"}`))
+	}()
+	waitForBucketNameWaiters(t, 1)
+	resultB := make(chan error, 1)
+	go func() { resultB <- ReconcileLocalBucketCleanups(root) }()
+	waitForBucketNameWaiters(t, 2)
+	releaseOnce.Do(func() { close(release) })
+	if err := <-resultA; err != nil {
+		t.Fatalf("first cleanup: %v", err)
+	}
+	if got := <-created; got.Code != http.StatusCreated {
+		t.Fatalf("create after cleanup: %d %s", got.Code, got.Body.String())
+	}
+	if err := <-resultB; err != nil {
+		t.Fatalf("stale cleanup: %v", err)
+	}
+	if removeCalls.Load() != 1 {
+		t.Fatalf("stale worker removed recreated bucket: calls=%d", removeCalls.Load())
+	}
+	if exists, err := backend.BucketExists(name); err != nil || !exists {
+		t.Fatalf("recreated bucket directory was removed: exists=%v err=%v", exists, err)
+	}
+	rc, err := backend.GetObject(name, "new")
+	if err != nil {
+		t.Fatalf("recreated bucket bytes were removed: %v", err)
+	}
+	gotBytes, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil || string(gotBytes) != "new-bytes" {
+		t.Fatalf("recreated bucket bytes changed: %q %v", gotBytes, err)
+	}
+	var live models.Bucket
+	if err := database.DB.Where("name = ?", name).First(&live).Error; err != nil {
+		t.Fatalf("recreated bucket row missing: %v", err)
+	}
+	t.Cleanup(func() { itDeleteBucketRows(live.ID) })
+}
+
+func waitForBucketNameWaiters(t *testing.T, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var waiting int64
+		err := database.DB.Raw(`SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'SELECT pg_advisory_lock(%'`).Scan(&waiting).Error
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting >= want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("only %d bucket-name lock waiters appeared", want-1)
 }
 
 // Postgres-gated integration tests for the listing paths: S3
@@ -861,6 +975,66 @@ func TestIntegrationDeleteBucketChangedEndpointCannotDeleteWrongEmptyBucket(t *t
 	}
 	if remaining != 1 || upstreamDeletes != 0 {
 		t.Fatalf("changed route touched upstream or metadata: rows=%d deletes=%d", remaining, upstreamDeletes)
+	}
+}
+
+func TestIntegrationDeleteBucketSecretRotationKeepsRouteVerified(t *testing.T) {
+	cfg := itConfig(t)
+	var upstreamDeletes int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			upstreamDeletes++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotImplemented)
+	}))
+	defer upstream.Close()
+	cfg.Storage.S3.Endpoint = strings.TrimPrefix(upstream.URL, "http://")
+	cfg.Storage.S3.Region = "us-east-1"
+	cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.SecretAccessKey = "same-account-key", "old-secret"
+	cfg.Storage.S3.ForcePathStyle = true
+	admin := mkUser(t, itName("secret-rotation"), "password-123", true, false)
+	bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+	pinTestS3Route(t, cfg, &bucket)
+	cfg.Storage.S3.SecretAccessKey = "rotated-secret"
+	router := itRouter(admin)
+	router.DELETE("/buckets/:name", NewBucketHandler(cfg).DeleteBucket)
+	if got := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil); got.Code != http.StatusOK {
+		t.Fatalf("secret rotation blocked same route: %d %s", got.Code, got.Body.String())
+	}
+	if upstreamDeletes != 1 {
+		t.Fatalf("unexpected upstream deletes: %d", upstreamDeletes)
+	}
+}
+
+func TestIntegrationDeleteBucketChangedAccessKeyRefused(t *testing.T) {
+	cfg := itConfig(t)
+	var upstreamDeletes int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			upstreamDeletes++
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotImplemented)
+	}))
+	defer upstream.Close()
+	cfg.Storage.S3.Endpoint = strings.TrimPrefix(upstream.URL, "http://")
+	cfg.Storage.S3.Region = "us-east-1"
+	cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.SecretAccessKey = "original-account-key", "secret"
+	cfg.Storage.S3.ForcePathStyle = true
+	admin := mkUser(t, itName("account-change"), "password-123", true, false)
+	bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+	pinTestS3Route(t, cfg, &bucket)
+	cfg.Storage.S3.AccessKeyID = "different-account-key"
+	router := itRouter(admin)
+	router.DELETE("/buckets/:name", NewBucketHandler(cfg).DeleteBucket)
+	if got := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil); got.Code != http.StatusConflict {
+		t.Fatalf("changed account accepted: %d %s", got.Code, got.Body.String())
+	}
+	if upstreamDeletes != 0 {
+		t.Fatalf("changed account reached upstream: %d", upstreamDeletes)
 	}
 }
 

@@ -280,6 +280,12 @@ func (h *BucketHandler) CreateBucket(c *gin.Context) {
 		})
 		return
 	}
+	unlockName, lockErr := lockBucketName(c.Request.Context(), req.Name)
+	if lockErr != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to lock bucket name", Message: lockErr.Error()})
+		return
+	}
+	defer unlockName()
 
 	// Check if bucket already exists in our database
 	var existing models.Bucket
@@ -933,7 +939,7 @@ func (h *BucketHandler) DeleteBucket(c *gin.Context) {
 		return
 	}
 	if localCleanup != nil {
-		if err := cleanupLocalBucket(localCleanup); err != nil {
+		if err := cleanupLocalBucketLocked(localCleanup); err != nil {
 			c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to delete bucket from storage", Message: err.Error()})
 			return
 		}
@@ -982,18 +988,16 @@ func readLocalRootIdentity(root string) (string, error) {
 
 func ensureLocalRootIdentity(root string) (string, error) {
 	if id, err := readLocalRootIdentity(root); err == nil {
-		return id, nil
+		return id, syncLocalRootDir(root)
 	} else if !os.IsNotExist(err) {
 		return "", err
 	}
 	id := uuid.NewString()
-	f, err := os.OpenFile(filepath.Join(root, localRootIdentityFile), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if os.IsExist(err) {
-		return readLocalRootIdentity(root)
-	}
+	f, err := os.CreateTemp(root, ".bkt-root-id-tmp-")
 	if err != nil {
 		return "", err
 	}
+	defer os.Remove(f.Name())
 	if _, err := f.WriteString(id + "\n"); err != nil {
 		f.Close()
 		return "", err
@@ -1005,22 +1009,57 @@ func ensureLocalRootIdentity(root string) (string, error) {
 	if err := f.Close(); err != nil {
 		return "", err
 	}
-	d, err := os.Open(root)
-	if err != nil {
+	if err := os.Link(f.Name(), filepath.Join(root, localRootIdentityFile)); err != nil {
+		if os.IsExist(err) {
+			id, err := readLocalRootIdentity(root)
+			if err != nil {
+				return "", err
+			}
+			return id, syncLocalRootDir(root)
+		}
 		return "", err
 	}
-	defer d.Close()
-	if err := d.Sync(); err != nil {
+	if err := syncLocalRootDir(root); err != nil {
 		return "", err
 	}
 	return id, nil
+}
+
+func syncLocalRootDir(root string) error {
+	d, err := os.Open(root)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 var removeLocalBucket = func(rootPath, name string) error {
 	return storage.NewLocalStorage(rootPath).DeleteBucket(name)
 }
 
-func cleanupLocalBucket(entry *models.LocalBucketCleanup) error {
+// cleanupLocalBucketLocked must be called while holding the bucket-name
+// advisory lock. A worker that took an old snapshot must not remove bytes
+// after another worker cleared its tombstone and CreateBucket reused the name.
+func cleanupLocalBucketLocked(snapshot *models.LocalBucketCleanup) error {
+	var entry models.LocalBucketCleanup
+	err := database.DB.Where("id = ? AND name = ?", snapshot.ID, snapshot.Name).First(&entry).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if entry.RootPath != snapshot.RootPath || entry.RootIdentity != snapshot.RootIdentity {
+		return fmt.Errorf("local bucket %q cleanup record changed", snapshot.Name)
+	}
+	var live int64
+	if err := database.DB.Model(&models.Bucket{}).Where("name = ?", entry.Name).Count(&live).Error; err != nil {
+		return err
+	}
+	if live != 0 {
+		return fmt.Errorf("local bucket %q was recreated before cleanup", entry.Name)
+	}
 	rootID, err := readLocalRootIdentity(entry.RootPath)
 	if err != nil {
 		return fmt.Errorf("failed to verify local storage root: %w", err)
@@ -1036,7 +1075,7 @@ func cleanupLocalBucket(entry *models.LocalBucketCleanup) error {
 
 // ReconcileLocalBucketCleanups retries durable cleanup after a crash or
 // filesystem failure. Only the configured root path is touched; a changed
-// root path leaves its cleanup record in place for operator recovery.
+// root identity fails closed and leaves its cleanup record for recovery.
 func ReconcileLocalBucketCleanups(rootPath string) error {
 	root, err := filepath.Abs(rootPath)
 	if err != nil {
@@ -1050,11 +1089,13 @@ func ReconcileLocalBucketCleanups(rootPath string) error {
 		if entries[i].RootPath != root {
 			continue
 		}
-		rootID, err := readLocalRootIdentity(root)
-		if err != nil || rootID != entries[i].RootIdentity {
-			continue
+		unlock, err := lockBucketName(context.Background(), entries[i].Name)
+		if err != nil {
+			return err
 		}
-		if err := cleanupLocalBucket(&entries[i]); err != nil {
+		err = cleanupLocalBucketLocked(&entries[i])
+		unlock()
+		if err != nil {
 			return fmt.Errorf("local bucket %q cleanup: %w", entries[i].Name, err)
 		}
 	}
