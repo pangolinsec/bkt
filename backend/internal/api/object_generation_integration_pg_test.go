@@ -206,6 +206,62 @@ func TestIntegrationConsoleDeleteRetainsGenerationForReaders(t *testing.T) {
 	}
 }
 
+func TestIntegrationDeleteBucketKeepsLegacyBytesWhenMetadataCommitFails(t *testing.T) {
+	cfg := itConfig(t)
+	admin := mkUser(t, itName("bucket-rollback"), "password-123", true, false)
+	bucket := itBucket(t, admin.ID, nil)
+	backend := storage.NewLocalStorage(cfg.Storage.RootPath)
+	content := []byte("legacy-bytes")
+	if err := backend.PutObject(bucket.Name, "legacy", bytes.NewReader(content), int64(len(content)), "text/plain", nil); err != nil {
+		t.Fatal(err)
+	}
+	info, err := backend.GetObjectInfo(bucket.Name, "legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.Create(&models.Object{
+		BucketID: bucket.ID, Key: "legacy", Size: info.Size, ContentType: "text/plain",
+		ETag: info.ETag, StoragePath: "legacy",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	// Force failure at the bucket row commit after DeleteBucket has visited
+	// storage. The database transaction will roll back all metadata deletes.
+	if err := database.DB.Exec(`CREATE FUNCTION bkt_test_block_bucket_delete() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'injected bucket delete failure'; END;
+		$$ LANGUAGE plpgsql`).Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.DB.Exec("DROP FUNCTION IF EXISTS bkt_test_block_bucket_delete()") })
+	if err := database.DB.Exec(`CREATE TRIGGER bkt_test_block_bucket_delete
+		BEFORE DELETE ON buckets FOR EACH ROW
+		EXECUTE FUNCTION bkt_test_block_bucket_delete()`).Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.DB.Exec("DROP TRIGGER IF EXISTS bkt_test_block_bucket_delete ON buckets") })
+
+	router := itRouter(admin)
+	router.DELETE("/buckets/:name", NewBucketHandler(cfg).DeleteBucket)
+	result := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil)
+	if result.Code != http.StatusInternalServerError {
+		t.Fatalf("injected bucket delete failure: %d %s", result.Code, result.Body.String())
+	}
+	var current models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "legacy").First(&current).Error; err != nil {
+		t.Fatalf("metadata should roll back with bucket delete: %v", err)
+	}
+	rc, err := backend.GetObject(bucket.Name, "legacy")
+	if err != nil {
+		t.Fatalf("live legacy bytes were deleted before metadata commit: %v", err)
+	}
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	if err != nil || !bytes.Equal(got, content) {
+		t.Errorf("live legacy bytes changed after failed bucket delete: %q %v", got, err)
+	}
+}
+
 func TestIntegrationGenerationCrashConsoleMove(t *testing.T) {
 	if generationCrashChild(t) {
 		return
