@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -249,14 +250,17 @@ func unlockAdvisory(conn *sql.Conn, holds []advisoryHold) {
 
 func validateLockedBuckets(ctx context.Context, buckets ...*models.Bucket) error {
 	for _, bucket := range buckets {
-		var n int64
-		if err := database.DB.WithContext(ctx).Model(&models.Bucket{}).
-			Where("id = ? AND name = ?", bucket.ID, bucket.Name).Count(&n).Error; err != nil {
+		var fresh models.Bucket
+		if err := database.DB.WithContext(ctx).Where("id = ? AND name = ?", bucket.ID, bucket.Name).First(&fresh).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return fmt.Errorf("bucket %q was deleted or replaced while waiting for its lock", bucket.Name)
+			}
 			return err
 		}
-		if n != 1 {
-			return fmt.Errorf("bucket %q was deleted or replaced while waiting for its lock", bucket.Name)
-		}
+		// The caller loaded its bucket before waiting for the shared lock.
+		// Exclusive settings/versioning changes can commit during that wait;
+		// every retention, quota, and versioning decision must use this fresh row.
+		*bucket = fresh
 	}
 	return nil
 }
