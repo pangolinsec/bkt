@@ -77,6 +77,8 @@ func generationCrashChild(t *testing.T) bool {
 		itDo(s3, http.MethodPost, "/"+bucketName+"/dest?uploadId="+upload.UploadId, body)
 	case "console":
 		consoleUpload(t, itConsoleRouter(cfg, owner), bucketName, "dest", "new-bytes")
+	case "console-delete":
+		itDo(itConsoleRouter(cfg, owner), http.MethodDelete, objectURL(bucketName, "dest"), nil)
 	default:
 		t.Fatalf("unknown crash mode %q", mode)
 	}
@@ -129,6 +131,59 @@ func TestIntegrationGenerationCrashConsoleUpload(t *testing.T) {
 	if after.Code != http.StatusOK || after.Body.String() != "old-bytes" || after.Header().Get("ETag") != before.Header().Get("ETag") {
 		t.Errorf("console crash exposed uncommitted bytes: status=%d body=%q ETag=%q committed ETag=%q",
 			after.Code, after.Body.String(), after.Header().Get("ETag"), before.Header().Get("ETag"))
+	}
+}
+
+func TestIntegrationGenerationCrashConsoleDelete(t *testing.T) {
+	if generationCrashChild(t) {
+		return
+	}
+	cfg, _, bucket, router := generationFixture(t)
+	// A pre-migration row still points at mutable public-key bytes. Deleting
+	// those bytes before removing the row is the original crash-consistency gap.
+	backend := storage.NewLocalStorage(cfg.Storage.RootPath)
+	if err := backend.PutObject(bucket.Name, "dest", bytes.NewReader([]byte("old-bytes")), 9, "text/plain", nil); err != nil {
+		t.Fatal(err)
+	}
+	info, err := backend.GetObjectInfo(bucket.Name, "dest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.Create(&models.Object{
+		BucketID: bucket.ID, Key: "dest", Size: 9, ContentType: "text/plain", ETag: info.ETag, StoragePath: "dest",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	before := itDo(router, http.MethodHead, "/"+bucket.Name+"/dest", nil)
+	runGenerationCrash(t, cfg, bucket.Name, "console-delete", "")
+	after := itDo(router, http.MethodGet, "/"+bucket.Name+"/dest", nil)
+	if after.Code != http.StatusOK || after.Body.String() != "old-bytes" || after.Header().Get("ETag") != before.Header().Get("ETag") {
+		t.Errorf("console delete crash lost committed bytes: status=%d body=%q ETag=%q committed ETag=%q",
+			after.Code, after.Body.String(), after.Header().Get("ETag"), before.Header().Get("ETag"))
+	}
+}
+
+func TestIntegrationConsoleDeleteRetainsGenerationForReaders(t *testing.T) {
+	cfg, owner, bucket, s3 := generationFixture(t)
+	s3PutString(t, s3, bucket.Name, "dest", "old-bytes")
+	var current models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "dest").First(&current).Error; err != nil {
+		t.Fatal(err)
+	}
+	backend := storage.NewLocalStorage(cfg.Storage.RootPath)
+	if w := itDo(itConsoleRouter(cfg, owner), http.MethodDelete, objectURL(bucket.Name, "dest"), nil); w.Code != http.StatusOK {
+		t.Fatalf("console delete: %d %s", w.Code, w.Body.String())
+	}
+	if w := itDo(s3, http.MethodGet, "/"+bucket.Name+"/dest", nil); w.Code != http.StatusNotFound {
+		t.Errorf("deleted current remained visible: %d %s", w.Code, w.Body.String())
+	}
+	rc, err := backend.GetGeneration(bucket.Name, "dest", current.GenerationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	if bytes, err := io.ReadAll(rc); err != nil || string(bytes) != "old-bytes" {
+		t.Errorf("deleted generation lost before reader-safe reclamation: %q %v", bytes, err)
 	}
 }
 

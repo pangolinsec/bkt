@@ -1949,13 +1949,20 @@ func (h *BucketHandler) DeleteObject(c *gin.Context) {
 		return
 	}
 
-	// Delete file from storage backend
-	if err := storageBackend.DeleteObject(bucketName, objectKey); err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
-			Error:   "Failed to delete object from storage",
-			Message: err.Error(),
-		})
-		return
+	// The metadata row is the visibility boundary. A physical generation (or
+	// pre-migration public-key blob) remains until a reader-safe collector can
+	// prove it is unreferenced; deleting it first would strand a live row if
+	// the process stopped before the database commit.
+	if _, generationAware := storageBackend.(storage.GenerationStorage); generationAware {
+		generationCommitBoundary("console-delete")
+	} else {
+		if err := storageBackend.DeleteObject(bucketName, objectKey); err != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse{
+				Error:   "Failed to delete object from storage",
+				Message: err.Error(),
+			})
+			return
+		}
 	}
 
 	// Delete object metadata from database
