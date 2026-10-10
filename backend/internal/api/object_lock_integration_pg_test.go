@@ -96,6 +96,61 @@ func TestIntegrationS3VersioningWaitsForObjectWriter(t *testing.T) {
 	assertBlockedUntilRelease(t, done, release, http.StatusOK)
 }
 
+func TestIntegrationDeleteBucketReloadsRetentionAfterLockWait(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("delete-retention"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) { b.Versioning = models.VersioningEnabled })
+	s3PutString(t, itS3Router(cfg, owner), bucket.Name, "held", "retained bytes")
+	release := holdBucketAdvisoryShared(t, bucket.Name)
+	router := itRouter(owner)
+	router.DELETE("/:name", NewBucketHandler(cfg).DeleteBucket)
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- itDo(router, http.MethodDelete, "/"+bucket.Name, nil) }()
+
+	// Observe the DELETE blocked on its advisory lock. It has already loaded
+	// the initial bucket row at this point, so the new retention value tests
+	// whether that stale row is reloaded before any destructive operation.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting int64
+		err := database.DB.Raw(`SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'SELECT pg_advisory_lock(%'`).Scan(&waiting).Error
+		if err != nil {
+			release()
+			t.Fatal(err)
+		}
+		if waiting > 0 {
+			break
+		}
+		select {
+		case w := <-done:
+			release()
+			t.Fatalf("DELETE completed before bucket lock released: %d %s", w.Code, w.Body.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			release()
+			t.Fatal("DELETE never waited on bucket advisory lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := database.DB.Model(&models.Bucket{}).Where("id = ?", bucket.ID).Update("retention_days", 30).Error; err != nil {
+		release()
+		t.Fatal(err)
+	}
+	release()
+	select {
+	case w := <-done:
+		if w.Code != http.StatusConflict {
+			t.Errorf("DELETE after retention raised: %d %s, want 409", w.Code, w.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("DELETE did not complete after lock released")
+	}
+	if status, body := s3GetString(t, itS3Router(cfg, owner), bucket.Name, "held"); status != http.StatusOK || body != "retained bytes" {
+		t.Errorf("retained object: status=%d body=%q", status, body)
+	}
+}
+
 type gateBody struct {
 	data    []byte
 	entered chan struct{}
