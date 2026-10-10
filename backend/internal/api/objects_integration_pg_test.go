@@ -290,6 +290,61 @@ func TestIntegrationS3MultipartContentHeaders(t *testing.T) {
 	}
 }
 
+func TestIntegrationS3CopySourceConditions(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("copycond"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, nil)
+	router := itS3Router(cfg, owner)
+	source := "/" + bucket.Name + "/source"
+	dest := "/" + bucket.Name + "/dest"
+	s3PutString(t, router, bucket.Name, "source", "source-bytes")
+	s3PutString(t, router, bucket.Name, "dest", "untouched")
+	sourceHead := itDo(router, http.MethodHead, source, nil)
+	if sourceHead.Code != http.StatusOK || sourceHead.Header().Get("ETag") == "" {
+		t.Fatalf("source HEAD: %d", sourceHead.Code)
+	}
+	etag := sourceHead.Header().Get("ETag")
+	copyWith := func(extra map[string]string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPut, dest, nil)
+		req.Header.Set("x-amz-copy-source", source)
+		for name, value := range extra {
+			req.Header.Set(name, value)
+		}
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	past := time.Now().Add(-time.Hour).UTC().Format(http.TimeFormat)
+	future := time.Now().Add(time.Hour).UTC().Format(http.TimeFormat)
+	for name, headers := range map[string]map[string]string{
+		"wrong ETag":        {"x-amz-copy-source-if-match": `"different"`},
+		"matching none":     {"x-amz-copy-source-if-none-match": etag},
+		"older than cutoff": {"x-amz-copy-source-if-unmodified-since": past},
+		"newer than cutoff": {"x-amz-copy-source-if-modified-since": future},
+	} {
+		w := copyWith(headers)
+		if w.Code != http.StatusPreconditionFailed {
+			t.Errorf("%s: status %d, want 412", name, w.Code)
+		}
+		if code, body := s3GetString(t, router, bucket.Name, "dest"); code != http.StatusOK || body != "untouched" {
+			t.Errorf("%s changed destination: status=%d body=%q", name, code, body)
+		}
+	}
+	for name, headers := range map[string]map[string]string{
+		"matching ETag":        {"x-amz-copy-source-if-match": etag},
+		"different none":       {"x-amz-copy-source-if-none-match": `"different"`},
+		"unmodified at future": {"x-amz-copy-source-if-unmodified-since": future},
+		"modified after past":  {"x-amz-copy-source-if-modified-since": past},
+		"match wins over old unmodified": {"x-amz-copy-source-if-match": etag,
+			"x-amz-copy-source-if-unmodified-since": past},
+	} {
+		w := copyWith(headers)
+		if w.Code != http.StatusOK {
+			t.Errorf("%s: status %d, want 200", name, w.Code)
+		}
+	}
+}
+
 func TestIntegrationDeleteBucketClearsReplicationTargets(t *testing.T) {
 	cfg := itConfig(t)
 	admin := mkUser(t, itName("adm"), "password-123", true, false)
