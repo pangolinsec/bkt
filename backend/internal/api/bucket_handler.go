@@ -682,9 +682,9 @@ type adminBucketView struct {
 	Permissions   *bucketPermissionsView `json:"permissions,omitempty"`
 }
 
-// DeleteBucket deletes a bucket and all its contents
+// DeleteBucket deletes a bucket. S3-backed buckets must already be empty.
 // @Summary Delete a bucket
-// @Description Admin-only. Deletes a bucket and all its objects from both the database and the storage backend.
+// @Description Admin-only. Local buckets are deleted with their contents. S3-backed buckets must be emptied first so an upstream refusal cannot delete live object bytes before the database commit.
 // @Tags buckets
 // @Accept json
 // @Produce json
@@ -777,31 +777,17 @@ func (h *BucketHandler) DeleteBucket(c *gin.Context) {
 		return
 	}
 
-	// Delete all objects from storage first
-	var storageErrors []string
-	for _, obj := range objects {
-		if err := storageBackend.DeleteObject(bucketName, obj.Key); err != nil {
-			// Log error but continue - we'll still try to delete the rest
-			storageErrors = append(storageErrors, fmt.Sprintf("%s: %v", obj.Key, err))
+	// S3's own DeleteBucket checks whether the bucket is empty. Do not remove
+	// any referenced object bytes before that check: a later refusal (for
+	// example, because an orphan generation is still present) would leave live
+	// metadata pointing at deleted bytes. S3 buckets must be emptied first.
+	// Local storage can remove its entire directory after the DB commit, which
+	// keeps legacy bytes readable if that commit rolls back.
+	if bucket.StorageBackend == "s3" {
+		if err := storageBackend.DeleteBucket(bucketName); err != nil {
+			c.JSON(http.StatusConflict, models.ErrorResponse{Error: "Failed to delete bucket from storage", Message: err.Error()})
+			return
 		}
-	}
-
-	// Delete archived version bytes too. On the S3 backend they live inside
-	// the real bucket (".bkt-versions/"), which otherwise can never be
-	// emptied and deleted; the local backend removes its version directory
-	// in DeleteBucket anyway.
-	var versions []models.ObjectVersion
-	if err := database.DB.Where("bucket_id = ? AND is_delete_marker = false", bucket.ID).Find(&versions).Error; err == nil {
-		for _, v := range versions {
-			if err := storageBackend.DeleteObjectVersion(bucketName, v.Key, v.VersionID); err != nil {
-				storageErrors = append(storageErrors, fmt.Sprintf("%s@%s: %v", v.Key, v.VersionID, err))
-			}
-		}
-	}
-
-	// Delete the bucket from storage backend (after objects are removed)
-	if err := storageBackend.DeleteBucket(bucketName); err != nil {
-		storageErrors = append(storageErrors, fmt.Sprintf("bucket deletion: %v", err))
 	}
 
 	// Use transaction to delete all objects and the bucket from database
@@ -855,10 +841,9 @@ func (h *BucketHandler) DeleteBucket(c *gin.Context) {
 			bucket.Name,
 			err.Error(),
 			map[string]interface{}{
-				"bucket_name":    bucket.Name,
-				"owner_id":       bucket.OwnerID.String(),
-				"objects_count":  len(objects),
-				"storage_errors": storageErrors,
+				"bucket_name":   bucket.Name,
+				"owner_id":      bucket.OwnerID.String(),
+				"objects_count": len(objects),
 			},
 		)
 
@@ -867,6 +852,12 @@ func (h *BucketHandler) DeleteBucket(c *gin.Context) {
 			Message: err.Error(),
 		})
 		return
+	}
+	if bucket.StorageBackend != "s3" {
+		if err := storageBackend.DeleteBucket(bucketName); err != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to delete bucket from storage", Message: err.Error()})
+			return
+		}
 	}
 
 	// Log success
@@ -1222,40 +1213,33 @@ func (h *BucketHandler) ListObjects(c *gin.Context) {
 					}
 				}
 
-				// Add new objects to database in background using batch inserts
-				// Batch size of 100 balances memory usage vs query count
-				const batchSize = 100
+				// Recheck each candidate under the same key lock as deletes.
+				// The listing may have seen a legacy public key just before its
+				// metadata was removed; an unlocked background insert could then
+				// resurrect it after the physical delete.
 				importDone := h.reconcileImportDone
 				if len(newObjects) > 0 {
-					go func(objs []models.Object) {
+					go func(objs []models.Object, listedBucket models.Bucket) {
 						if importDone != nil {
 							defer importDone()
 						}
-						// Process in batches to avoid huge queries
-						for i := 0; i < len(objs); i += batchSize {
-							end := i + batchSize
-							if end > len(objs) {
-								end = len(objs)
+						for _, obj := range objs {
+							ctx, cancel := context.WithTimeout(context.Background(), reconcilePruneLockWait)
+							unlock, err := lockObjectKeysChecked(ctx, &listedBucket, obj.Key)
+							cancel()
+							if err != nil {
+								continue // a later listing can retry the import
 							}
-							batch := objs[i:end]
-
-							// Build batch insert query
-							valueStrings := make([]string, 0, len(batch))
-							valueArgs := make([]interface{}, 0, len(batch)*8)
-							for _, obj := range batch {
-								valueStrings = append(valueStrings, "(gen_random_uuid(), ?, ?, ?, ?, ?, ?, '', ?, ?)")
-								valueArgs = append(valueArgs, obj.BucketID, obj.Key, obj.Size, obj.ContentType, obj.ETag, obj.StoragePath, obj.CreatedAt, obj.UpdatedAt)
-							}
-
-							query := fmt.Sprintf(`
+							if _, err := storageBackend.GetObjectInfo(listedBucket.Name, obj.Key); err == nil {
+								database.DB.Exec(`
 								INSERT INTO objects (id, bucket_id, key, size, content_type, e_tag, storage_path, sha256, created_at, updated_at)
-								VALUES %s
-								ON CONFLICT (bucket_id, key) DO NOTHING
-							`, strings.Join(valueStrings, ","))
-
-							database.DB.Exec(query, valueArgs...)
+								VALUES (gen_random_uuid(), ?, ?, ?, ?, ?, ?, '', ?, ?)
+								ON CONFLICT (bucket_id, key) DO NOTHING`,
+									obj.BucketID, obj.Key, obj.Size, obj.ContentType, obj.ETag, obj.StoragePath, obj.CreatedAt, obj.UpdatedAt)
+							}
+							unlock()
 						}
-					}(newObjects)
+					}(newObjects, bucket)
 
 					// Add to response immediately (don't wait for DB), but only
 					// keys inside this page's range — keys at or before the
@@ -1986,6 +1970,10 @@ func (h *BucketHandler) DeleteObject(c *gin.Context) {
 			Error:   "Failed to delete object metadata",
 			Message: err.Error(),
 		})
+		return
+	}
+	if err := deleteLegacyCurrentAfterCommit(storageBackend, &bucket, &object); err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to delete legacy object from storage", Message: err.Error()})
 		return
 	}
 

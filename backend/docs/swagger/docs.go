@@ -657,7 +657,7 @@ const docTemplate = `{
                         "BearerAuth": []
                     }
                 ],
-                "description": "Admin-only. Deletes a bucket and all its objects from both the database and the storage backend.",
+                "description": "Admin-only. Local buckets are deleted with their contents. S3-backed buckets must be emptied first so an upstream refusal cannot delete live object bytes before the database commit.",
                 "consumes": [
                     "application/json"
                 ],

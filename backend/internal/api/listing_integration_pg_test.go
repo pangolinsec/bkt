@@ -193,6 +193,22 @@ type fakeS3Listing struct {
 func (f *fakeS3Listing) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.Method == http.MethodHead:
+		parts := strings.SplitN(strings.Trim(r.URL.Path, "/"), "/", 2)
+		if len(parts) == 2 {
+			f.mu.Lock()
+			found := false
+			for _, key := range f.keys {
+				if key == parts[1] {
+					found = true
+					break
+				}
+			}
+			f.mu.Unlock()
+			if !found {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+		}
 		w.WriteHeader(http.StatusOK)
 	case r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2":
 		prefix := r.URL.Query().Get("prefix")
@@ -410,15 +426,91 @@ func TestIntegrationDeletedLegacyS3ObjectStaysDeletedAfterConsoleList(t *testing
 	}
 }
 
+func TestIntegrationLegacyDeleteDoesNotRaceListingImport(t *testing.T) {
+	cfg := itConfig(t)
+	fake := &fakeS3Listing{keys: []string{"legacy"}}
+	deleteEntered := make(chan struct{})
+	releaseDelete := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && strings.Count(strings.Trim(r.URL.Path, "/"), "/") == 1 {
+			close(deleteEntered)
+			<-releaseDelete
+		}
+		fake.ServeHTTP(w, r)
+	}))
+	defer srv.Close()
+	defer func() {
+		select {
+		case <-releaseDelete:
+		default:
+			close(releaseDelete)
+		}
+	}()
+	cfg.Storage.S3.Endpoint = strings.TrimPrefix(srv.URL, "http://")
+	cfg.Storage.S3.Region = "us-east-1"
+	cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.SecretAccessKey = "AK", "SK"
+	cfg.Storage.S3.ForcePathStyle = true
+
+	admin := mkUser(t, itName("legacy-race"), "password-123", true, false)
+	bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+	seedRows(t, bucket.ID, time.Now().Add(-time.Hour), "legacy")
+	consoleHandler := NewBucketHandler(cfg)
+	importDone := make(chan struct{})
+	consoleHandler.reconcileImportDone = func() { close(importDone) }
+	console := itRouter(admin)
+	console.GET("/buckets/:name/objects", consoleHandler.ListObjects)
+	s3 := itS3Router(cfg, admin)
+	s3.DELETE("/:bucket/*key", NewS3APIHandler(cfg).DeleteObject)
+
+	deleted := make(chan int, 1)
+	go func() {
+		deleted <- itDo(s3, http.MethodDelete, "/"+bucket.Name+"/legacy", nil).Code
+	}()
+	select {
+	case <-deleteEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("legacy cleanup did not reach S3")
+	}
+	if got := rowKeys(t, bucket.ID); len(got) != 0 {
+		t.Fatalf("metadata should be gone before the physical delete: %v", got)
+	}
+	// This listing observes the still-present public key while deletion holds
+	// its key lock. Its background import must recheck existence after the
+	// delete completes rather than create a stale row from the old listing.
+	if listed := listObjectsKeys(t, console, bucket.Name); len(listed) != 1 || listed[0] != "legacy" {
+		t.Fatalf("listing did not capture the in-flight legacy key: %v", listed)
+	}
+	close(releaseDelete)
+	select {
+	case code := <-deleted:
+		if code != http.StatusNoContent {
+			t.Errorf("S3 DeleteObject: %d", code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("legacy delete did not finish")
+	}
+	select {
+	case <-importDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("listing import did not finish")
+	}
+	if rows := rowKeys(t, bucket.ID); len(rows) != 0 {
+		t.Errorf("concurrent listing resurrected deleted legacy key: %v", rows)
+	}
+}
+
 func TestIntegrationDeleteBucketDoesNotCommitAfterS3StorageRefusesDeletion(t *testing.T) {
 	cfg := itConfig(t)
+	var objectDeletes, bucketDeletes int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodHead:
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodDelete && strings.Count(strings.Trim(r.URL.Path, "/"), "/") == 1:
+			objectDeletes++
 			w.WriteHeader(http.StatusNoContent) // public key, not hidden generation
 		case r.Method == http.MethodDelete:
+			bucketDeletes++
 			w.WriteHeader(http.StatusConflict) // hidden generation keeps bucket nonempty
 		default:
 			w.WriteHeader(http.StatusNotImplemented)
@@ -448,5 +540,8 @@ func TestIntegrationDeleteBucketDoesNotCommitAfterS3StorageRefusesDeletion(t *te
 	database.DB.Model(&models.Object{}).Where("bucket_id = ?", bucket.ID).Count(&remainingObject)
 	if remainingBucket != 1 || remainingObject != 1 {
 		t.Errorf("failed bucket deletion lost metadata: buckets=%d objects=%d", remainingBucket, remainingObject)
+	}
+	if objectDeletes != 0 || bucketDeletes != 1 {
+		t.Errorf("failed bucket deletion touched object bytes: object DELETEs=%d bucket DELETEs=%d", objectDeletes, bucketDeletes)
 	}
 }
