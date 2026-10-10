@@ -122,6 +122,51 @@ func TestIntegrationS3MultipartPublishesHiddenGeneration(t *testing.T) {
 	}
 }
 
+func TestIntegrationS3PutStreamsIntoHiddenGeneration(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-s3-put"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+	var saved []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/"+bucket.Name+"/.bkt-generations/") {
+			t.Errorf("PUT touched public physical key: %s", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		switch r.Method {
+		case http.MethodPut:
+			if r.Header.Get("If-None-Match") != "*" {
+				t.Error("generation PUT lacked create-only condition")
+			}
+			saved, _ = io.ReadAll(r.Body)
+			w.Header().Set("ETag", `"generated-etag"`)
+		case http.MethodGet:
+			if saved == nil {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_, _ = w.Write(saved)
+		default:
+			t.Errorf("unexpected upstream request: %s", r.Method)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer upstream.Close()
+	cfg.Storage.S3.Endpoint = strings.TrimPrefix(upstream.URL, "http://")
+	cfg.Storage.S3.Region = "us-east-1"
+	cfg.Storage.S3.AccessKeyID = "fixture-access"
+	cfg.Storage.S3.SecretAccessKey = "fixture-secret"
+	cfg.Storage.S3.ForcePathStyle = true
+	router := itS3Router(cfg, owner)
+	put := itDo(router, http.MethodPut, "/"+bucket.Name+"/key", []byte("bytes"))
+	if put.Code != http.StatusOK {
+		t.Fatalf("S3-backed PUT: %d %s", put.Code, put.Body.String())
+	}
+	if status, body := s3GetString(t, router, bucket.Name, "key"); status != http.StatusOK || body != "bytes" {
+		t.Errorf("S3-backed GET: %d %q", status, body)
+	}
+}
+
 func TestIntegrationGenerationPointersResolveCurrentRangeConsoleAndHistory(t *testing.T) {
 	cfg := itConfig(t)
 	owner := mkUser(t, itName("generation-read"), "password-123", true, false)

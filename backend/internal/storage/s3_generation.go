@@ -33,24 +33,52 @@ func (s3s *S3Storage) PutGeneration(bucketName, objectKey, generationID string, 
 	if err != nil {
 		return nil, err
 	}
+	tmp, n, err := spoolS3Payload(data, size, "bkt-s3-generation-put-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(tmp.Name())
+	defer tmp.Close()
 	input := &s3.PutObjectInput{
 		Bucket: aws.String(s3s.getBucketName(bucketName)), Key: aws.String(key),
-		Body: data, ContentType: aws.String(contentType), Metadata: metadata,
+		Body: tmp, ContentType: aws.String(contentType), Metadata: metadata,
 		IfNoneMatch: aws.String("*"),
 	}
-	if size >= 0 {
-		input.ContentLength = aws.Int64(size)
-	}
+	input.ContentLength = aws.Int64(n)
 	if s3s.sse {
 		input.ServerSideEncryption = types.ServerSideEncryptionAes256
 	}
 	// Streaming upload intentionally has no total timeout. The conditional
 	// write guarantees an existing generation is never overwritten.
-	out, err := s3s.client.PutObject(context.Background(), input)
+	out, err := s3s.client.PutObject(context.Background(), input, func(o *s3.Options) {
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to publish generation: %w", err)
 	}
-	return &ObjectInfo{Key: objectKey, Size: size, ContentType: contentType, LastModified: time.Now().UTC().Format(time.RFC3339), ETag: strings.Trim(aws.ToString(out.ETag), `"`)}, nil
+	return &ObjectInfo{Key: objectKey, Size: n, ContentType: contentType, LastModified: time.Now().UTC().Format(time.RFC3339), ETag: strings.Trim(aws.ToString(out.ETag), `"`)}, nil
+}
+
+// spoolS3Payload drains a verified API stream before the AWS SDK signs it.
+// Its temporary file is private and caller-owned on success.
+func spoolS3Payload(data io.Reader, expected int64, pattern string) (*os.File, int64, error) {
+	tmp, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return nil, 0, err
+	}
+	n, err := io.Copy(tmp, data)
+	if err == nil && expected >= 0 && n != expected {
+		err = fmt.Errorf("generation payload size mismatch: wrote %d, expected %d", n, expected)
+	}
+	if err == nil {
+		_, err = tmp.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return nil, 0, err
+	}
+	return tmp, n, nil
 }
 
 func (s3s *S3Storage) GetGeneration(bucketName, objectKey, generationID string) (io.ReadCloser, error) {
@@ -132,25 +160,14 @@ func (s3s *S3Storage) UploadGenerationPart(bucketName, objectKey, generationID, 
 	if partNumber < 1 || partNumber > 10000 {
 		return "", fmt.Errorf("invalid part number %d", partNumber)
 	}
-	// The API body is guarded and intentionally nonseekable. The AWS signer
-	// needs to hash a seekable request body on HTTP S3-compatible backends.
-	// Spool one already-bounded part, then sign/upload exactly those bytes.
-	tmp, err := os.CreateTemp("", "bkt-s3-generation-part-*")
+	// The API body is guarded and intentionally nonseekable. Spool one
+	// already-bounded part for HTTP S3-compatible request signing.
+	tmp, n, err := spoolS3Payload(data, size, "bkt-s3-generation-part-*")
 	if err != nil {
 		return "", err
 	}
 	defer os.Remove(tmp.Name())
 	defer tmp.Close()
-	n, err := io.Copy(tmp, data)
-	if err != nil {
-		return "", fmt.Errorf("failed to stage generation part: %w", err)
-	}
-	if size >= 0 && n != size {
-		return "", fmt.Errorf("generation part size mismatch: wrote %d, expected %d", n, size)
-	}
-	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
-		return "", err
-	}
 	input := &s3.UploadPartInput{
 		Bucket: aws.String(s3s.getBucketName(bucketName)), Key: aws.String(key),
 		UploadId: aws.String(uploadID), PartNumber: aws.Int32(int32(partNumber)), Body: tmp,
