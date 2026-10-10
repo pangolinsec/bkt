@@ -98,6 +98,19 @@ func (h *BucketHandler) SetBucketSettings(c *gin.Context) {
 			return
 		}
 	}
+	// A settings change can alter retention, versioning constraints, quota,
+	// public reads, or replication while an object mutation is in flight.
+	// Serialize the decision and update with writers and bucket deletion.
+	unlockBucket, lockErr := lockBucketExclusive(c.Request.Context(), &bucket)
+	if lockErr != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to lock bucket", Message: lockErr.Error()})
+		return
+	}
+	defer unlockBucket()
+	if err := refreshLockedBucket(c.Request.Context(), &bucket); err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to reload bucket", Message: err.Error()})
+		return
+	}
 
 	updates := map[string]interface{}{}
 

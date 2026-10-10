@@ -303,6 +303,16 @@ func (h *BucketHandler) SetBucketVersioning(c *gin.Context) {
 		c.JSON(http.StatusForbidden, models.ErrorResponse{Error: "Permission denied", Message: "Changing versioning requires admin or " + services.ActionPutBucketVersioning + " on the bucket"})
 		return
 	}
+	unlockBucket, lockErr := lockBucketExclusive(c.Request.Context(), &bucket)
+	if lockErr != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to lock bucket", Message: lockErr.Error()})
+		return
+	}
+	defer unlockBucket()
+	if err := refreshLockedBucket(c.Request.Context(), &bucket); err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to reload bucket", Message: err.Error()})
+		return
+	}
 	if req.Versioning == models.VersioningSuspended && bucket.RetentionDays > 0 {
 		c.JSON(http.StatusConflict, models.ErrorResponse{
 			Error:   "Retention active",

@@ -101,6 +101,16 @@ func (h *S3APIHandler) PutBucketVersioning(c *gin.Context) {
 		h.s3Error(c, "MalformedXML", "Status must be Enabled or Suspended", "", http.StatusBadRequest)
 		return
 	}
+	unlockBucket, lockErr := lockBucketExclusive(c.Request.Context(), &bucket)
+	if lockErr != nil {
+		h.s3Error(c, "InternalError", "Failed to lock bucket", "", http.StatusInternalServerError)
+		return
+	}
+	defer unlockBucket()
+	if err := refreshLockedBucket(c.Request.Context(), &bucket); err != nil {
+		h.s3Error(c, "InternalError", "Failed to reload bucket", "", http.StatusInternalServerError)
+		return
+	}
 	if status == models.VersioningSuspended && bucket.RetentionDays > 0 {
 		h.s3Error(c, "InvalidBucketState", "Versioning cannot be suspended while retention is set", bucketName, http.StatusConflict)
 		return

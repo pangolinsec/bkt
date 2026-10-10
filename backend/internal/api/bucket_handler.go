@@ -733,6 +733,10 @@ func (h *BucketHandler) DeleteBucket(c *gin.Context) {
 		return
 	}
 	defer unlockBucket()
+	if err := refreshLockedBucket(c.Request.Context(), &bucket); err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to reload bucket", Message: err.Error()})
+		return
+	}
 
 	// Get storage backend for this bucket
 	storageBackend, err := h.getStorageBackend(&bucket)
