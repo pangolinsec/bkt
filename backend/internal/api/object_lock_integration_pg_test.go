@@ -1,0 +1,176 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"bkt/internal/database"
+	"bkt/internal/models"
+)
+
+type gateBody struct {
+	data    []byte
+	entered chan struct{}
+	release chan struct{}
+	opened  bool
+}
+
+func (b *gateBody) Read(p []byte) (int, error) {
+	if !b.opened {
+		b.opened = true
+		close(b.entered)
+		<-b.release
+	}
+	if len(b.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, b.data)
+	b.data = b.data[n:]
+	return n, nil
+}
+
+func waitGate(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("request did not reach body read")
+	}
+}
+
+func TestIntegrationBucketDeleteWaitsForInflightPut(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("bucket-lock"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, nil)
+	s3 := itS3Router(cfg, owner)
+	body := &gateBody{data: []byte("committed"), entered: make(chan struct{}), release: make(chan struct{})}
+	putReq := httptest.NewRequest(http.MethodPut, "/"+bucket.Name+"/raced", body)
+	putReq.ContentLength = int64(len(body.data))
+	putDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		s3.ServeHTTP(w, putReq)
+		putDone <- w
+	}()
+	waitGate(t, body.entered)
+
+	console := itRouter(owner)
+	console.DELETE("/:name", NewBucketHandler(cfg).DeleteBucket)
+	deleteDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() { deleteDone <- itDo(console, http.MethodDelete, "/"+bucket.Name, nil) }()
+	select {
+	case response := <-deleteDone:
+		close(body.release)
+		t.Fatalf("bucket deletion completed while object upload was in flight: %d %s", response.Code, response.Body.String())
+	case <-time.After(150 * time.Millisecond):
+	}
+	close(body.release)
+	select {
+	case put := <-putDone:
+		if put.Code != http.StatusOK {
+			t.Errorf("PUT status %d: %s", put.Code, put.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PUT did not complete")
+	}
+	select {
+	case del := <-deleteDone:
+		if del.Code != http.StatusOK {
+			t.Errorf("DELETE bucket status %d: %s", del.Code, del.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("bucket deletion did not complete")
+	}
+	var n int64
+	if err := database.DB.Model(&models.Object{}).Where("bucket_id = ?", bucket.ID).Count(&n).Error; err != nil || n != 0 {
+		t.Errorf("object rows after bucket deletion: count=%d err=%v", n, err)
+	}
+}
+
+func TestIntegrationTaggingRechecksDeletedCurrentObject(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("tag-lock"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, nil)
+	h := NewS3APIHandler(cfg)
+	router := itRouter(owner)
+	router.PUT("/:bucket/*key", h.PutObject)
+	router.DELETE("/:bucket/*key", h.DeleteObject)
+	s3PutString(t, router, bucket.Name, "tagged", "old")
+
+	xml := []byte(`<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>`)
+	body := &gateBody{data: xml, entered: make(chan struct{}), release: make(chan struct{})}
+	req := httptest.NewRequest(http.MethodPut, "/"+bucket.Name+"/tagged?tagging", body)
+	req.ContentLength = int64(len(xml))
+	tagDone := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		tagDone <- w
+	}()
+	waitGate(t, body.entered)
+	del := itDo(router, http.MethodDelete, "/"+bucket.Name+"/tagged", nil)
+	if del.Code != http.StatusNoContent {
+		t.Fatalf("DELETE current object: %d %s", del.Code, del.Body.String())
+	}
+	close(body.release)
+	select {
+	case tag := <-tagDone:
+		if tag.Code != http.StatusNotFound {
+			t.Errorf("tagging deleted current object returned %d, want 404", tag.Code)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("tagging request did not complete")
+	}
+	var n int64
+	if err := database.DB.Model(&models.Object{}).Where("bucket_id = ? AND key = ?", bucket.ID, "tagged").Count(&n).Error; err != nil || n != 0 {
+		t.Errorf("deleted object row: count=%d err=%v", n, err)
+	}
+}
+
+func TestIntegrationCancelledObjectLockWait(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("cancel-lock"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, nil)
+	hold := lockObjectKeys(bucket.Name, "wait")
+	defer hold()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPut, "/"+bucket.Name+"/wait", bytes.NewBufferString("x")).WithContext(ctx)
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		w := httptest.NewRecorder()
+		itS3Router(cfg, owner).ServeHTTP(w, req)
+		done <- w
+	}()
+	lockID := bucket.Name + "\x00wait"
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		objectKeyLocks.Lock()
+		e := objectKeyLocks.m[lockID]
+		waiting := e != nil && e.refs >= 2
+		objectKeyLocks.Unlock()
+		if waiting {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("PUT did not wait on the held object lock")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		hold()
+		<-done
+		t.Fatal("canceled foreground PUT kept waiting on a key lock")
+	}
+	if n := objectLockEntries(); n != 1 {
+		t.Errorf("canceled waiter leaked local lock entries: %d", n)
+	}
+}
