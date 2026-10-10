@@ -41,6 +41,27 @@ func TestIsS3BucketNotEmptyRequiresErrorCode(t *testing.T) {
 	}
 }
 
+func TestIsS3BucketNotFoundRequiresErrorCode(t *testing.T) {
+	response := func(status int, code string) error {
+		return &awshttp.ResponseError{ResponseError: &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
+			Err:      &smithy.GenericAPIError{Code: code},
+		}}
+	}
+	if !IsS3BucketNotFound(response(http.StatusNotFound, "NoSuchBucket")) {
+		t.Error("an already removed upstream bucket should permit DB retry")
+	}
+	for _, err := range []error{
+		response(http.StatusNotFound, "NoSuchKey"),
+		response(http.StatusForbidden, "NoSuchBucket"),
+		respErr(http.StatusNotFound),
+	} {
+		if IsS3BucketNotFound(err) {
+			t.Errorf("unrelated upstream error allowed DB deletion retry: %v", err)
+		}
+	}
+}
+
 func TestClassifyMoveDestinationHead(t *testing.T) {
 	if err := classifyMoveDestinationHead(nil, "b", "k"); err == nil {
 		t.Error("existing destination must be refused")

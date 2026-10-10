@@ -541,7 +541,7 @@ func TestIntegrationDeleteBucketDoesNotCommitAfterS3StorageRefusesDeletion(t *te
 	if remainingBucket != 1 || remainingObject != 1 {
 		t.Errorf("failed bucket deletion lost metadata: buckets=%d objects=%d", remainingBucket, remainingObject)
 	}
-	if objectDeletes != 0 || bucketDeletes != 1 {
+	if objectDeletes != 0 || bucketDeletes != 0 {
 		t.Errorf("failed bucket deletion touched object bytes: object DELETEs=%d bucket DELETEs=%d", objectDeletes, bucketDeletes)
 	}
 }
@@ -559,6 +559,9 @@ func TestIntegrationDeleteBucketClearsUnreferencedS3Generations(t *testing.T) {
 		switch {
 		case r.Method == http.MethodHead:
 			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Query().Has("versioning"):
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = w.Write([]byte(`<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"/>`))
 		case r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2":
 			w.Header().Set("Content-Type", "application/xml")
 			if physical[orphan] {
@@ -605,5 +608,140 @@ func TestIntegrationDeleteBucketClearsUnreferencedS3Generations(t *testing.T) {
 	defer mu.Unlock()
 	if remaining != 0 || len(physical) != 0 || objectDeletes != 1 || bucketDeletes != 2 {
 		t.Errorf("orphan cleanup: bucket rows=%d physical=%v object DELETEs=%d bucket DELETEs=%d", remaining, physical, objectDeletes, bucketDeletes)
+	}
+}
+
+func TestIntegrationDeleteBucketRefusesPublicKeysAndNativeVersioning(t *testing.T) {
+	for _, tc := range []struct {
+		name, versioning string
+		public           bool
+	}{
+		{name: "unindexed public object", public: true},
+		{name: "native S3 versions", versioning: "Enabled"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := itConfig(t)
+			physical := map[string]bool{".bkt-generations/orphan": true}
+			if tc.public {
+				physical["out-of-band-live"] = true
+			}
+			// A native-versioned bucket retains an older version when an
+			// unversioned DeleteObject only removes its current listing entry.
+			nativeVersionRemains := tc.versioning != ""
+			var objectDeletes int
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodHead:
+					w.WriteHeader(http.StatusOK)
+				case r.Method == http.MethodGet && r.URL.Query().Has("versioning"):
+					w.Header().Set("Content-Type", "application/xml")
+					_, _ = fmt.Fprintf(w, `<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>%s</Status></VersioningConfiguration>`, tc.versioning)
+				case r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2":
+					w.Header().Set("Content-Type", "application/xml")
+					keys := make([]string, 0, len(physical))
+					for key := range physical {
+						keys = append(keys, key)
+					}
+					sort.Strings(keys)
+					_, _ = w.Write([]byte(`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`))
+					for _, key := range keys {
+						_, _ = fmt.Fprintf(w, `<Contents><Key>%s</Key><Size>1</Size></Contents>`, key)
+					}
+					_, _ = w.Write([]byte(`<IsTruncated>false</IsTruncated></ListBucketResult>`))
+				case r.Method == http.MethodDelete && strings.Contains(strings.Trim(r.URL.Path, "/"), "/"):
+					objectDeletes++
+					delete(physical, strings.SplitN(strings.Trim(r.URL.Path, "/"), "/", 2)[1])
+					w.WriteHeader(http.StatusNoContent)
+				case r.Method == http.MethodDelete:
+					if len(physical) > 0 || nativeVersionRemains {
+						w.Header().Set("Content-Type", "application/xml")
+						w.WriteHeader(http.StatusConflict)
+						_, _ = w.Write([]byte(`<Error><Code>BucketNotEmpty</Code></Error>`))
+					} else {
+						w.WriteHeader(http.StatusNoContent)
+					}
+				default:
+					w.WriteHeader(http.StatusNotImplemented)
+				}
+			}))
+			defer upstream.Close()
+			cfg.Storage.S3.Endpoint = strings.TrimPrefix(upstream.URL, "http://")
+			cfg.Storage.S3.Region = "us-east-1"
+			cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.SecretAccessKey = "AK", "SK"
+			cfg.Storage.S3.ForcePathStyle = true
+			admin := mkUser(t, itName("bucket-refuse"), "password-123", true, false)
+			bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+			router := itRouter(admin)
+			router.DELETE("/buckets/:name", NewBucketHandler(cfg).DeleteBucket)
+			deleted := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil)
+			if deleted.Code != http.StatusConflict {
+				t.Fatalf("unsafe cleanup was not refused: %d %s", deleted.Code, deleted.Body.String())
+			}
+			var remaining int64
+			if err := database.DB.Model(&models.Bucket{}).Where("id = ?", bucket.ID).Count(&remaining).Error; err != nil {
+				t.Fatal(err)
+			}
+			if remaining != 1 || objectDeletes != 0 || !physical[".bkt-generations/orphan"] || (tc.public && !physical["out-of-band-live"]) {
+				t.Errorf("refusal damaged bucket: row=%d physical=%v object DELETEs=%d", remaining, physical, objectDeletes)
+			}
+		})
+	}
+}
+
+func TestIntegrationDeleteBucketRetriesAfterMetadataCommitFailure(t *testing.T) {
+	cfg := itConfig(t)
+	var bucketDeletes int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.WriteHeader(http.StatusOK)
+		case http.MethodDelete:
+			bucketDeletes++
+			if bucketDeletes == 1 {
+				w.WriteHeader(http.StatusNoContent)
+			} else {
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`<Error><Code>NoSuchBucket</Code></Error>`))
+			}
+		default:
+			w.WriteHeader(http.StatusNotImplemented)
+		}
+	}))
+	defer upstream.Close()
+	cfg.Storage.S3.Endpoint = strings.TrimPrefix(upstream.URL, "http://")
+	cfg.Storage.S3.Region = "us-east-1"
+	cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.SecretAccessKey = "AK", "SK"
+	cfg.Storage.S3.ForcePathStyle = true
+	admin := mkUser(t, itName("bucket-retry"), "password-123", true, false)
+	bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+	if err := database.DB.Exec(`CREATE FUNCTION bkt_test_block_bucket_delete() RETURNS trigger AS $$
+		BEGIN RAISE EXCEPTION 'injected bucket delete failure'; END;
+		$$ LANGUAGE plpgsql`).Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.DB.Exec("DROP FUNCTION IF EXISTS bkt_test_block_bucket_delete()") })
+	if err := database.DB.Exec(`CREATE TRIGGER bkt_test_block_bucket_delete BEFORE DELETE ON buckets
+		FOR EACH ROW EXECUTE FUNCTION bkt_test_block_bucket_delete()`).Error; err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.DB.Exec("DROP TRIGGER IF EXISTS bkt_test_block_bucket_delete ON buckets") })
+	router := itRouter(admin)
+	router.DELETE("/buckets/:name", NewBucketHandler(cfg).DeleteBucket)
+	if failed := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil); failed.Code != http.StatusInternalServerError {
+		t.Fatalf("injected DB failure: %d %s", failed.Code, failed.Body.String())
+	}
+	if err := database.DB.Exec("DROP TRIGGER bkt_test_block_bucket_delete ON buckets").Error; err != nil {
+		t.Fatal(err)
+	}
+	if retried := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil); retried.Code != http.StatusOK {
+		t.Fatalf("retry after upstream removal: %d %s", retried.Code, retried.Body.String())
+	}
+	var remaining int64
+	if err := database.DB.Model(&models.Bucket{}).Where("id = ?", bucket.ID).Count(&remaining).Error; err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 || bucketDeletes != 2 {
+		t.Errorf("retry did not reconcile metadata: bucket rows=%d upstream DELETEs=%d", remaining, bucketDeletes)
 	}
 }

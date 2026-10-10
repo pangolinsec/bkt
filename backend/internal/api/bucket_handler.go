@@ -684,7 +684,7 @@ type adminBucketView struct {
 
 // DeleteBucket deletes a bucket. S3-backed buckets must have no live objects.
 // @Summary Delete a bucket
-// @Description Admin-only. Local buckets are deleted with their contents. S3-backed buckets must have no live objects or versions; unreferenced physical blobs are cleaned up before deletion.
+// @Description Admin-only. Local buckets are deleted with their contents. S3-backed buckets require no live objects, versions, or uploads. Only BKT hidden orphan blobs are reclaimed; public upstream keys and native versioning require manual cleanup.
 // @Tags buckets
 // @Accept json
 // @Produce json
@@ -785,24 +785,24 @@ func (h *BucketHandler) DeleteBucket(c *gin.Context) {
 	// Local storage can remove its entire directory after the DB commit, which
 	// keeps legacy bytes readable if that commit rolls back.
 	if bucket.StorageBackend == "s3" {
-		if err := storageBackend.DeleteBucket(bucketName); err != nil {
+		var contentVersions, activeUploads int64
+		if err := database.DB.Model(&models.ObjectVersion{}).
+			Where("bucket_id = ? AND is_delete_marker = false", bucket.ID).Count(&contentVersions).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to check bucket versions", Message: err.Error()})
+			return
+		}
+		if err := database.DB.Model(&models.MultipartUpload{}).
+			Where("bucket_name = ? AND status = ?", bucket.Name, "in-progress").Count(&activeUploads).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to check bucket uploads", Message: err.Error()})
+			return
+		}
+		if len(objects) != 0 || contentVersions != 0 || activeUploads != 0 {
+			c.JSON(http.StatusConflict, models.ErrorResponse{Error: "Bucket is not empty", Message: "Delete objects, versions, and in-progress uploads before deleting this S3 bucket"})
+			return
+		}
+		if err := storageBackend.DeleteBucket(bucketName); err != nil && !storage.IsS3BucketNotFound(err) {
 			if !storage.IsS3BucketNotEmpty(err) {
 				c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to delete bucket from storage", Message: err.Error()})
-				return
-			}
-			var contentVersions, activeUploads int64
-			if err := database.DB.Model(&models.ObjectVersion{}).
-				Where("bucket_id = ? AND is_delete_marker = false", bucket.ID).Count(&contentVersions).Error; err != nil {
-				c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to check bucket versions", Message: err.Error()})
-				return
-			}
-			if err := database.DB.Model(&models.MultipartUpload{}).
-				Where("bucket_name = ? AND status = ?", bucket.Name, "in-progress").Count(&activeUploads).Error; err != nil {
-				c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to check bucket uploads", Message: err.Error()})
-				return
-			}
-			if len(objects) != 0 || contentVersions != 0 || activeUploads != 0 {
-				c.JSON(http.StatusConflict, models.ErrorResponse{Error: "Bucket is not empty", Message: "Delete objects, versions, and in-progress uploads before deleting this S3 bucket"})
 				return
 			}
 			s3Backend, ok := storageBackend.(*storage.S3Storage)
@@ -811,11 +811,19 @@ func (h *BucketHandler) DeleteBucket(c *gin.Context) {
 				return
 			}
 			if err := s3Backend.EmptyBucket(bucketName); err != nil {
-				c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to empty S3 bucket", Message: err.Error()})
+				status := http.StatusInternalServerError
+				if errors.Is(err, storage.ErrS3BucketContainsPublicObjects) || errors.Is(err, storage.ErrS3BucketUsesNativeVersioning) {
+					status = http.StatusConflict
+				}
+				c.JSON(status, models.ErrorResponse{Error: "Failed to empty S3 bucket", Message: err.Error()})
 				return
 			}
-			if err := storageBackend.DeleteBucket(bucketName); err != nil {
-				c.JSON(http.StatusConflict, models.ErrorResponse{Error: "Failed to delete bucket from storage", Message: err.Error()})
+			if err := storageBackend.DeleteBucket(bucketName); err != nil && !storage.IsS3BucketNotFound(err) {
+				status := http.StatusInternalServerError
+				if storage.IsS3BucketNotEmpty(err) {
+					status = http.StatusConflict
+				}
+				c.JSON(status, models.ErrorResponse{Error: "Failed to delete bucket from storage", Message: err.Error()})
 				return
 			}
 		}

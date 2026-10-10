@@ -68,6 +68,45 @@ func TestIntegrationSettingsWaitForObjectWriter(t *testing.T) {
 	assertBlockedUntilRelease(t, done, release, http.StatusOK)
 }
 
+func TestIntegrationMultipartInitiationWaitsForBucketDeletionLock(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("multipart-lock"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, nil)
+	release, err := lockBucketExclusive(context.Background(), &bucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s3 := itS3Router(cfg, owner)
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- itDo(s3, http.MethodPost, "/"+bucket.Name+"/pending?uploads", nil)
+	}()
+	select {
+	case w := <-done:
+		release()
+		t.Fatalf("multipart initiation bypassed bucket deletion lock: %d %s", w.Code, w.Body.String())
+	case <-time.After(150 * time.Millisecond):
+	}
+	var uploads int64
+	if err := database.DB.Model(&models.MultipartUpload{}).Where("bucket_name = ?", bucket.Name).Count(&uploads).Error; err != nil {
+		release()
+		t.Fatal(err)
+	}
+	if uploads != 0 {
+		release()
+		t.Fatalf("multipart tracking row appeared under exclusive bucket lock: %d", uploads)
+	}
+	release()
+	select {
+	case w := <-done:
+		if w.Code != http.StatusOK {
+			t.Errorf("multipart initiation after lock release: %d %s", w.Code, w.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("multipart initiation did not finish after lock release")
+	}
+}
+
 func TestIntegrationRESTVersioningWaitsForObjectWriter(t *testing.T) {
 	cfg := itConfig(t)
 	owner := mkUser(t, itName("rest-vers-lock"), "password-123", true, false)
