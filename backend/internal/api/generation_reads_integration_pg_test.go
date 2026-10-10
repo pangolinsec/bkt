@@ -35,6 +35,8 @@ func TestIntegrationS3MultipartPublishesHiddenGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	var hiddenPath string
+	upstreamUploadID := "upstream-" + uuid.NewString()
+	t.Cleanup(func() { database.DB.Where("upload_id = ?", upstreamUploadID).Delete(&models.MultipartUpload{}) })
 	completed := false
 	completeCalls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -60,14 +62,14 @@ func TestIntegrationS3MultipartPublishesHiddenGeneration(t *testing.T) {
 		q, _ := url.ParseQuery(r.URL.RawQuery)
 		switch {
 		case r.Method == http.MethodPost && q.Has("uploads"):
-			_, _ = w.Write([]byte(`<InitiateMultipartUploadResult><UploadId>upstream-upload</UploadId></InitiateMultipartUploadResult>`))
+			_, _ = w.Write([]byte(`<InitiateMultipartUploadResult><UploadId>` + upstreamUploadID + `</UploadId></InitiateMultipartUploadResult>`))
 		case r.Method == http.MethodPut && q.Get("partNumber") == "1":
 			body, err := io.ReadAll(r.Body)
 			if err != nil || string(body) != "new" {
 				t.Errorf("part body: %q %v", body, err)
 			}
 			w.Header().Set("ETag", `"part-etag"`)
-		case r.Method == http.MethodPost && q.Get("uploadId") == "upstream-upload":
+		case r.Method == http.MethodPost && q.Get("uploadId") == upstreamUploadID:
 			completeCalls++
 			if completed {
 				w.WriteHeader(http.StatusNotFound)
@@ -85,7 +87,7 @@ func TestIntegrationS3MultipartPublishesHiddenGeneration(t *testing.T) {
 			}
 			w.Header().Set("ETag", `"committed-etag"`)
 			w.Header().Set("Content-Length", "3")
-		case r.Method == http.MethodGet && q.Get("uploadId") == "upstream-upload":
+		case r.Method == http.MethodGet && q.Get("uploadId") == upstreamUploadID:
 			if completed {
 				w.WriteHeader(http.StatusNotFound)
 				return
@@ -115,7 +117,7 @@ func TestIntegrationS3MultipartPublishesHiddenGeneration(t *testing.T) {
 		t.Fatalf("init: %d %s", start.Code, start.Body.String())
 	}
 	var init InitiateMultipartUploadResult
-	if err := xml.Unmarshal(start.Body.Bytes(), &init); err != nil || init.UploadId != "upstream-upload" {
+	if err := xml.Unmarshal(start.Body.Bytes(), &init); err != nil || init.UploadId != upstreamUploadID {
 		t.Fatalf("init XML: %+v %v", init, err)
 	}
 	part := itDo(router, http.MethodPut, "/"+bucket.Name+"/key?partNumber=1&uploadId="+init.UploadId, []byte("new"))
