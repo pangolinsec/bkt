@@ -186,4 +186,3 @@ func TestIntegrationCrossReplicaConditionalPut(t *testing.T) {
 		t.Errorf("current object after cross-replica race: %d %q", get.Code, get.Body.String())
 	}
 }
-
