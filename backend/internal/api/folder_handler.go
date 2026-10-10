@@ -269,8 +269,14 @@ func deleteCurrentObjectLocked(ctx context.Context, backend storage.StorageBacke
 	if retentionBlocks(bucket, obj.UpdatedAt) {
 		return false, true, nil
 	}
-	if err := backend.DeleteObject(bucket.Name, key); err != nil {
-		return false, false, fmt.Errorf("failed to delete object from storage: %w", err)
+	// Keep the physical generation or legacy public-key blob until a
+	// reader-safe collector can reclaim it after the metadata row is gone.
+	if _, generationAware := backend.(storage.GenerationStorage); generationAware {
+		generationCommitBoundary("folder-delete")
+	} else {
+		if err := backend.DeleteObject(bucket.Name, key); err != nil {
+			return false, false, fmt.Errorf("failed to delete object from storage: %w", err)
+		}
 	}
 	if err := database.DB.Delete(&models.Object{}, "id = ?", obj.ID).Error; err != nil {
 		return false, false, fmt.Errorf("failed to delete object metadata: %w", err)

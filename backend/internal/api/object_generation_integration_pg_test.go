@@ -83,6 +83,8 @@ func generationCrashChild(t *testing.T) bool {
 		console := itConsoleRouter(cfg, owner)
 		console.POST("/api/buckets/:name/objects/move", NewBucketHandler(cfg).MoveObject)
 		itDo(console, http.MethodPost, "/api/buckets/"+bucketName+"/objects/move", []byte(`{"source_key":"source","destination_key":"dest"}`))
+	case "folder-delete":
+		itDo(itConsoleRouter(cfg, owner), http.MethodDelete, folderURL(bucketName, "folder/"), nil)
 	default:
 		t.Fatalf("unknown crash mode %q", mode)
 	}
@@ -242,6 +244,33 @@ func TestIntegrationConsoleMovePublishesDestinationAndSourceMarker(t *testing.T)
 	var marker models.ObjectVersion
 	if err := database.DB.Where("bucket_id = ? AND key = ? AND is_delete_marker = ?", bucket.ID, "source", true).First(&marker).Error; err != nil || !marker.VersionedAt.After(archived.VersionedAt) {
 		t.Fatalf("source delete marker: %+v after %+v err=%v", marker, archived, err)
+	}
+}
+
+func TestIntegrationGenerationCrashFolderDelete(t *testing.T) {
+	if generationCrashChild(t) {
+		return
+	}
+	cfg, _, bucket, s3 := generationFixture(t)
+	backend := storage.NewLocalStorage(cfg.Storage.RootPath)
+	if err := backend.PutObject(bucket.Name, "folder/a", bytes.NewReader([]byte("old-bytes")), 9, "text/plain", nil); err != nil {
+		t.Fatal(err)
+	}
+	info, err := backend.GetObjectInfo(bucket.Name, "folder/a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.Create(&models.Object{
+		BucketID: bucket.ID, Key: "folder/a", Size: 9, ContentType: "text/plain", ETag: info.ETag, StoragePath: "folder/a",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	before := itDo(s3, http.MethodHead, "/"+bucket.Name+"/folder/a", nil)
+	runGenerationCrash(t, cfg, bucket.Name, "folder-delete", "")
+	after := itDo(s3, http.MethodGet, "/"+bucket.Name+"/folder/a", nil)
+	if after.Code != http.StatusOK || after.Body.String() != "old-bytes" || after.Header().Get("ETag") != before.Header().Get("ETag") {
+		t.Errorf("folder delete crash lost committed bytes: status=%d body=%q ETag=%q committed ETag=%q",
+			after.Code, after.Body.String(), after.Header().Get("ETag"), before.Header().Get("ETag"))
 	}
 }
 
