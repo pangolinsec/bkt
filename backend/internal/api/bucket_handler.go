@@ -1338,6 +1338,13 @@ func planReconcilePrune(rows []models.Object, listed map[string]storage.ObjectIn
 			plan.keep = append(plan.keep, obj)
 			continue
 		}
+		// Committed generations live in the private physical keyspace, which
+		// ListObjects intentionally hides. Absence of the public key cannot
+		// imply this metadata row is stale.
+		if obj.GenerationID != "" {
+			plan.keep = append(plan.keep, obj)
+			continue
+		}
 		persisted++
 		if _, ok := listed[obj.Key]; ok {
 			plan.keep = append(plan.keep, obj)
@@ -1369,7 +1376,7 @@ func pruneStaleObjectRows(bucket *models.Bucket, stale []models.Object) {
 		if !ok {
 			continue
 		}
-		res := database.DB.Where("id = ? AND updated_at = ?", obj.ID, obj.UpdatedAt).Delete(&models.Object{})
+		res := database.DB.Where("id = ? AND updated_at = ? AND generation_id = ''", obj.ID, obj.UpdatedAt).Delete(&models.Object{})
 		unlock()
 		if res.Error != nil {
 			logger.Warn("Failed to prune stale object row", map[string]interface{}{

@@ -84,6 +84,15 @@ func TestPlanReconcilePrune(t *testing.T) {
 			t.Errorf("plan = %+v", plan)
 		}
 	})
+
+	t.Run("immutable generations are absent from public physical listings", func(t *testing.T) {
+		rows := reconcileRows(1, old, now)
+		rows[0].GenerationID = uuid.NewString()
+		plan := planReconcilePrune(rows, map[string]storage.ObjectInfo{}, true, now)
+		if len(plan.stale) != 0 || len(plan.keep) != 1 || plan.missing != 0 {
+			t.Errorf("generation-backed row classified as stale: %+v", plan)
+		}
+	})
 }
 
 func TestS3ConfigLocationChanges(t *testing.T) {

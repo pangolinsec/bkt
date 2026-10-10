@@ -317,4 +317,23 @@ func TestIntegrationListObjectsReconcilePruneSafety(t *testing.T) {
 			t.Errorf("rows after a suspicious listing = %v", rows)
 		}
 	})
+
+	t.Run("hidden generation stays listed without a public physical key", func(t *testing.T) {
+		b := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+		seedRows(t, b.ID, old, "generated")
+		if err := database.DB.Model(&models.Object{}).Where("bucket_id = ? AND key = ?", b.ID, "generated").
+			UpdateColumns(map[string]interface{}{"generation_id": uuid.NewString(), "updated_at": old}).Error; err != nil {
+			t.Fatal(err)
+		}
+		fake.mu.Lock()
+		fake.keys = nil
+		fake.mu.Unlock()
+		if got := listObjectsKeys(t, r, b.Name); strings.Join(got, ",") != "generated" {
+			t.Fatalf("hidden generation disappeared from console listing: %v", got)
+		}
+		time.Sleep(100 * time.Millisecond)
+		if got := rowKeys(t, b.ID); strings.Join(got, ",") != "generated" {
+			t.Errorf("reconciliation pruned committed generation row: %v", got)
+		}
+	})
 }
