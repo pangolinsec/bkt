@@ -2005,6 +2005,7 @@ func (h *BucketHandler) HeadObject(c *gin.Context) {
 	c.Header("ETag", fmt.Sprintf("\"%s\"", object.ETag))
 	c.Header("Last-Modified", object.UpdatedAt.UTC().Format(http.TimeFormat))
 	c.Header("Accept-Ranges", "bytes")
+	writeStoredContentHeaders(c, object.ContentDisposition, object.CacheControl)
 
 	c.Status(http.StatusOK)
 }

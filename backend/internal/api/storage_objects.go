@@ -163,7 +163,7 @@ func upsertCurrentObject(obj *models.Object) error {
 		if err := tx.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "bucket_id"}, {Name: "key"}},
 			DoUpdates: clause.AssignmentColumns([]string{
-				"size", "content_type", "e_tag", "sha256", "storage_path",
+				"size", "content_type", "content_disposition", "cache_control", "e_tag", "sha256", "storage_path",
 				"metadata", "tags", "version_id", "updated_at",
 			}),
 		}).Create(obj).Error; err != nil {
@@ -239,18 +239,20 @@ func moveObjectWithinBucket(backend storage.StorageBackend, bucket *models.Bucke
 
 	if bucket.Versioning == models.VersioningEnabled {
 		dst := models.Object{
-			BucketID:    bucket.ID,
-			Key:         dstKey,
-			Size:        src.Size,
-			ContentType: src.ContentType,
-			ETag:        src.ETag,
-			SHA256:      src.SHA256,
-			StoragePath: dstKey,
-			Metadata:    src.Metadata,
-			Tags:        src.Tags,
-			VersionID:   uuid.New().String(),
-			CreatedAt:   now,
-			UpdatedAt:   now,
+			BucketID:           bucket.ID,
+			Key:                dstKey,
+			Size:               src.Size,
+			ContentType:        src.ContentType,
+			ContentDisposition: src.ContentDisposition,
+			CacheControl:       src.CacheControl,
+			ETag:               src.ETag,
+			SHA256:             src.SHA256,
+			StoragePath:        dstKey,
+			Metadata:           src.Metadata,
+			Tags:               src.Tags,
+			VersionID:          uuid.New().String(),
+			CreatedAt:          now,
+			UpdatedAt:          now,
 		}
 		if err := database.DB.Create(&dst).Error; err != nil {
 			_ = backend.DeleteObject(bucket.Name, dstKey)

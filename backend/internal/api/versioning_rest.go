@@ -204,7 +204,8 @@ func (h *BucketHandler) RestoreObjectVersion(c *gin.Context) {
 
 	obj := models.Object{
 		BucketID: bucket.ID, Key: req.Key, Size: ver.Size,
-		ContentType: ver.ContentType, ETag: ver.ETag, StoragePath: req.Key,
+		ContentType: ver.ContentType, ContentDisposition: ver.ContentDisposition,
+		CacheControl: ver.CacheControl, ETag: ver.ETag, StoragePath: req.Key,
 		Metadata: ver.Metadata, Tags: ver.Tags, VersionID: newCurrentVersionID(&bucket),
 	}
 	if err := upsertCurrentObject(&obj); err != nil {

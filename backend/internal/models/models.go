@@ -169,16 +169,18 @@ func (b *Bucket) BeforeCreate(tx *gorm.DB) error {
 
 // Object represents a stored object
 type Object struct {
-	ID          uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	BucketID    uuid.UUID `gorm:"type:uuid;not null;index;uniqueIndex:idx_bucket_key_unique" json:"bucket_id"`
-	Key         string    `gorm:"not null;uniqueIndex:idx_bucket_key_unique" json:"key"` // Object name/path
-	Size        int64     `gorm:"not null" json:"size"`
-	ContentType string    `json:"content_type"`
-	ETag        string    `json:"etag"`
-	SHA256      string    `json:"sha256,omitempty"`                     // SHA256 hash of content
-	StoragePath string    `gorm:"not null" json:"-"`                    // Internal file system path
-	Metadata    *string   `gorm:"type:jsonb" json:"metadata,omitempty"` // x-amz-meta-* user metadata (JSON map, nullable)
-	Tags        *string   `gorm:"type:jsonb" json:"tags,omitempty"`     // S3 object tags (JSON map, nullable)
+	ID                 uuid.UUID `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
+	BucketID           uuid.UUID `gorm:"type:uuid;not null;index;uniqueIndex:idx_bucket_key_unique" json:"bucket_id"`
+	Key                string    `gorm:"not null;uniqueIndex:idx_bucket_key_unique" json:"key"` // Object name/path
+	Size               int64     `gorm:"not null" json:"size"`
+	ContentType        string    `json:"content_type"`
+	ContentDisposition string    `json:"content_disposition,omitempty"`
+	CacheControl       string    `json:"cache_control,omitempty"`
+	ETag               string    `json:"etag"`
+	SHA256             string    `json:"sha256,omitempty"`                     // SHA256 hash of content
+	StoragePath        string    `gorm:"not null" json:"-"`                    // Internal file system path
+	Metadata           *string   `gorm:"type:jsonb" json:"metadata,omitempty"` // x-amz-meta-* user metadata (JSON map, nullable)
+	Tags               *string   `gorm:"type:jsonb" json:"tags,omitempty"`     // S3 object tags (JSON map, nullable)
 	// VersionID of the CURRENT version ("" = written while unversioned, the
 	// S3 "null" version). Non-current versions live in object_versions.
 	VersionID string    `gorm:"default:''" json:"version_id,omitempty"`

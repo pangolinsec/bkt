@@ -397,6 +397,7 @@ func replicateObjectLocked(srcBackend, dstBackend storage.StorageBackend, src, d
 	}
 	obj := models.Object{
 		BucketID: dst.ID, Key: key, Size: s.Size, ContentType: s.ContentType,
+		ContentDisposition: s.ContentDisposition, CacheControl: s.CacheControl,
 		ETag: s.ETag, SHA256: s.SHA256, StoragePath: key, Metadata: s.Metadata, Tags: s.Tags,
 		VersionID: newCurrentVersionID(dst),
 	}

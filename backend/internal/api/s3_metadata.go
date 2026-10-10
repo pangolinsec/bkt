@@ -131,6 +131,15 @@ func writeUserMetadataHeaders(c *gin.Context, obj *models.Object) {
 	}
 }
 
+func writeStoredContentHeaders(c *gin.Context, disposition, cacheControl string) {
+	if disposition != "" {
+		c.Header("Content-Disposition", disposition)
+	}
+	if cacheControl != "" {
+		c.Header("Cache-Control", cacheControl)
+	}
+}
+
 // ── ?tagging subresource ─────────────────────────────────────────────────────
 
 type taggingXML struct {

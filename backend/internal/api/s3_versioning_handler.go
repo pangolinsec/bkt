@@ -356,6 +356,7 @@ func (h *S3APIHandler) serveObjectVersion(c *gin.Context, bucket *models.Bucket,
 	}
 
 	c.Header("Content-Type", ver.ContentType)
+	writeStoredContentHeaders(c, ver.ContentDisposition, ver.CacheControl)
 	c.Header("ETag", `"`+ver.ETag+`"`)
 	c.Header("Last-Modified", ver.ContentModifiedAt.UTC().Format(http.TimeFormat))
 	c.Header("x-amz-version-id", ver.VersionID)

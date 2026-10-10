@@ -33,16 +33,18 @@ func archiveCurrentVersion(backend storage.StorageBackend, bucket *models.Bucket
 		return "", fmt.Errorf("failed to archive current version: %w", err)
 	}
 	ver := models.ObjectVersion{
-		BucketID:          bucket.ID,
-		Key:               obj.Key,
-		VersionID:         versionID,
-		Size:              obj.Size,
-		ContentType:       obj.ContentType,
-		ETag:              obj.ETag,
-		Metadata:          obj.Metadata,
-		Tags:              obj.Tags,
-		VersionedAt:       time.Now(),
-		ContentModifiedAt: obj.UpdatedAt,
+		BucketID:           bucket.ID,
+		Key:                obj.Key,
+		VersionID:          versionID,
+		Size:               obj.Size,
+		ContentType:        obj.ContentType,
+		ContentDisposition: obj.ContentDisposition,
+		CacheControl:       obj.CacheControl,
+		ETag:               obj.ETag,
+		Metadata:           obj.Metadata,
+		Tags:               obj.Tags,
+		VersionedAt:        time.Now(),
+		ContentModifiedAt:  obj.UpdatedAt,
 	}
 	if err := database.DB.Create(&ver).Error; err != nil {
 		// Best-effort undo so the current object isn't left without bytes.
@@ -149,17 +151,19 @@ func promoteNewestVersionIfNeeded(backend storage.StorageBackend, bucket *models
 		return fmt.Errorf("failed to promote version: %w", err)
 	}
 	obj := models.Object{
-		BucketID:    bucket.ID,
-		Key:         key,
-		Size:        newest.Size,
-		ContentType: newest.ContentType,
-		ETag:        newest.ETag,
-		StoragePath: key,
-		Metadata:    newest.Metadata,
-		Tags:        newest.Tags,
-		VersionID:   newest.VersionID,
-		CreatedAt:   newest.ContentModifiedAt,
-		UpdatedAt:   newest.ContentModifiedAt,
+		BucketID:           bucket.ID,
+		Key:                key,
+		Size:               newest.Size,
+		ContentType:        newest.ContentType,
+		ContentDisposition: newest.ContentDisposition,
+		CacheControl:       newest.CacheControl,
+		ETag:               newest.ETag,
+		StoragePath:        key,
+		Metadata:           newest.Metadata,
+		Tags:               newest.Tags,
+		VersionID:          newest.VersionID,
+		CreatedAt:          newest.ContentModifiedAt,
+		UpdatedAt:          newest.ContentModifiedAt,
 	}
 	if err := database.DB.Create(&obj).Error; err != nil {
 		return fmt.Errorf("failed to record promoted version: %w", err)

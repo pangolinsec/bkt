@@ -167,14 +167,16 @@ func (h *S3APIHandler) CreateMultipartUpload(c *gin.Context) {
 
 	// Track in database for cleanup purposes
 	mpu := models.MultipartUpload{
-		UploadID:    uploadID,
-		UserID:      userUUID,
-		BucketName:  bucketName,
-		ObjectKey:   objectKey,
-		ContentType: contentType,
-		Metadata:    mapToJSONPtr(userMeta),
-		Status:      "in-progress",
-		ExpiresAt:   time.Now().Add(7 * 24 * time.Hour),
+		UploadID:           uploadID,
+		UserID:             userUUID,
+		BucketName:         bucketName,
+		ObjectKey:          objectKey,
+		ContentType:        contentType,
+		ContentDisposition: c.GetHeader("Content-Disposition"),
+		CacheControl:       c.GetHeader("Cache-Control"),
+		Metadata:           mapToJSONPtr(userMeta),
+		Status:             "in-progress",
+		ExpiresAt:          time.Now().Add(7 * 24 * time.Hour),
 	}
 	if err := database.DB.Create(&mpu).Error; err != nil {
 		// Without the tracking row every later op on this uploadId would 404,
@@ -346,6 +348,10 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 	// Serialize with other writers of the target key.
 	unlock := lockObjectKeys(mpu.BucketName, mpu.ObjectKey)
 	defer unlock()
+	hadPrior, ok := h.checkWritePreconditions(c, bucket, mpu.ObjectKey)
+	if !ok {
+		return
+	}
 
 	// Quota: the assembled object's size is the sum of the listed parts. On
 	// S3-backed buckets the part listing is only requested when the bucket
@@ -380,8 +386,6 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 	}
 	defer reservation.release()
 
-	hadPrior := currentObjectExists(bucket.ID, mpu.ObjectKey)
-
 	// Versioning: archive the current version before the assembled object
 	// replaces it.
 	archivedVID, verr := prepareVersionedWrite(storageBackend, bucket, mpu.ObjectKey)
@@ -406,14 +410,16 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 	}
 
 	obj := models.Object{
-		BucketID:    bucket.ID,
-		Key:         mpu.ObjectKey,
-		Size:        objInfo.Size,
-		ContentType: mpu.ContentType,
-		ETag:        objInfo.ETag,
-		StoragePath: mpu.ObjectKey,
-		Metadata:    mpu.Metadata,
-		VersionID:   newCurrentVersionID(bucket),
+		BucketID:           bucket.ID,
+		Key:                mpu.ObjectKey,
+		Size:               objInfo.Size,
+		ContentType:        mpu.ContentType,
+		ContentDisposition: mpu.ContentDisposition,
+		CacheControl:       mpu.CacheControl,
+		ETag:               objInfo.ETag,
+		StoragePath:        mpu.ObjectKey,
+		Metadata:           mpu.Metadata,
+		VersionID:          newCurrentVersionID(bucket),
 	}
 	if err := upsertCurrentObject(&obj); err != nil {
 		discardFailedWrite(storageBackend, bucket, mpu.ObjectKey, archivedVID, hadPrior)

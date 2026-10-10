@@ -22,6 +22,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // S3APIHandler handles S3-compatible API requests
@@ -440,6 +441,7 @@ func (h *S3APIHandler) GetObject(c *gin.Context) {
 	c.Header("Accept-Ranges", "bytes")
 	c.Header("x-amz-request-id", uuid.New().String())
 	writeUserMetadataHeaders(c, &object)
+	writeStoredContentHeaders(c, object.ContentDisposition, object.CacheControl)
 
 	// Honor a Range request if present. We advertise Accept-Ranges, so clients
 	// (notably the AWS CLI/SDK, which split downloads >8MB into byte-range GETs)
@@ -602,6 +604,43 @@ func parseRange(header string, size int64) (start, length int64, ok, satisfiable
 	return start, end - start + 1, true, true
 }
 
+// etagConditionMatches applies an HTTP entity-tag condition to the current
+// object. S3 ETags are strong quoted tags; a weak tag cannot authorize a write.
+func etagConditionMatches(condition, etag string, exists bool) bool {
+	if !exists {
+		return false
+	}
+	for _, candidate := range strings.Split(condition, ",") {
+		candidate = strings.TrimSpace(candidate)
+		if candidate == "*" || candidate == `"`+etag+`"` {
+			return true
+		}
+	}
+	return false
+}
+
+// checkWritePreconditions must run while the caller holds the key's write
+// lock, before archiving or replacing bytes. The returned bool is whether a
+// current object exists; ok is false after an S3 error has been written.
+func (h *S3APIHandler) checkWritePreconditions(c *gin.Context, bucket *models.Bucket, key string) (exists, ok bool) {
+	var current models.Object
+	err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, key).First(&current).Error
+	exists = err == nil
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		h.s3Error(c, "InternalError", "Failed to check current object", key, http.StatusInternalServerError)
+		return false, false
+	}
+	if condition := c.GetHeader("If-Match"); condition != "" && !etagConditionMatches(condition, current.ETag, exists) {
+		h.s3Error(c, "PreconditionFailed", "If-Match precondition failed", key, http.StatusPreconditionFailed)
+		return false, false
+	}
+	if condition := c.GetHeader("If-None-Match"); condition != "" && etagConditionMatches(condition, current.ETag, exists) {
+		h.s3Error(c, "PreconditionFailed", "If-None-Match precondition failed", key, http.StatusPreconditionFailed)
+		return false, false
+	}
+	return exists, true
+}
+
 // PutObject handles PUT /{bucket}/{key+} (upload, copy, or multipart part)
 func (h *S3APIHandler) PutObject(c *gin.Context) {
 	// Unsupported sub-resources (?acl, ?retention, ?legal-hold, ...) and
@@ -725,6 +764,10 @@ func (h *S3APIHandler) PutObject(c *gin.Context) {
 	// must not interleave with a concurrent overwrite or delete.
 	unlock := lockObjectKeys(bucketName, objectKey)
 	defer unlock()
+	hadPrior, ok := h.checkWritePreconditions(c, &bucket, objectKey)
+	if !ok {
+		return
+	}
 
 	// Quota: reserve the declared size before any bytes are written; the
 	// reservation also tracks the bytes actually read (see guardedBody).
@@ -740,7 +783,6 @@ func (h *S3APIHandler) PutObject(c *gin.Context) {
 	// payload hash / chunk signatures) verified — so the backend can never
 	// commit an unverified or truncated body.
 	body := newGuardedBody(combinedReader, contentLength, h.config.Storage.MaxFileSize, reservation)
-	hadPrior := currentObjectExists(bucket.ID, objectKey)
 
 	// Versioning: archive the current version before overwriting.
 	archivedVID, verr := prepareVersionedWrite(storageBackend, &bucket, objectKey)
@@ -775,15 +817,17 @@ func (h *S3APIHandler) PutObject(c *gin.Context) {
 
 	// Record the new current version atomically (upsert).
 	object := models.Object{
-		BucketID:    bucket.ID,
-		Key:         objectKey,
-		Size:        objectInfo.Size,
-		ContentType: contentType,
-		ETag:        objectInfo.ETag,
-		StoragePath: objectKey,
-		Metadata:    mapToJSONPtr(userMeta),
-		Tags:        mapToJSONPtr(objTags),
-		VersionID:   newCurrentVersionID(&bucket),
+		BucketID:           bucket.ID,
+		Key:                objectKey,
+		Size:               objectInfo.Size,
+		ContentType:        contentType,
+		ContentDisposition: c.GetHeader("Content-Disposition"),
+		CacheControl:       c.GetHeader("Cache-Control"),
+		ETag:               objectInfo.ETag,
+		StoragePath:        objectKey,
+		Metadata:           mapToJSONPtr(userMeta),
+		Tags:               mapToJSONPtr(objTags),
+		VersionID:          newCurrentVersionID(&bucket),
 	}
 	if err := upsertCurrentObject(&object); err != nil {
 		discardFailedWrite(storageBackend, &bucket, objectKey, archivedVID, hadPrior)
@@ -1016,6 +1060,7 @@ func (h *S3APIHandler) HeadObject(c *gin.Context) {
 	c.Header("Accept-Ranges", "bytes")
 	c.Header("x-amz-request-id", uuid.New().String())
 	writeUserMetadataHeaders(c, &object)
+	writeStoredContentHeaders(c, object.ContentDisposition, object.CacheControl)
 
 	c.Status(http.StatusOK)
 }
@@ -1151,6 +1196,9 @@ func (h *S3APIHandler) CopyObject(c *gin.Context, copySource string) {
 		unlock = lockKeysAcrossBuckets(srcBucket, srcKey, destBucket, destKey)
 	}
 	defer unlock()
+	if _, ok := h.checkWritePreconditions(c, &destBucketModel, destKey); !ok {
+		return
+	}
 
 	var srcObj models.Object
 	if err := database.DB.Where("bucket_id = ? AND key = ?", srcBucketModel.ID, srcKey).First(&srcObj).Error; err != nil {
@@ -1167,10 +1215,14 @@ func (h *S3APIHandler) CopyObject(c *gin.Context, copySource string) {
 		destTags = replaceTags
 	}
 	destContentType := srcObj.ContentType
+	destDisposition := srcObj.ContentDisposition
+	destCacheControl := srcObj.CacheControl
 	if metaReplace {
 		if ct := c.GetHeader("Content-Type"); ct != "" {
 			destContentType = ct
 		}
+		destDisposition = c.GetHeader("Content-Disposition")
+		destCacheControl = c.GetHeader("Cache-Control")
 	}
 
 	// Quota: the copy adds srcObj.Size bytes to the destination (a metadata-
@@ -1255,16 +1307,18 @@ func (h *S3APIHandler) CopyObject(c *gin.Context, copySource string) {
 		return
 	}
 	destObj := models.Object{
-		BucketID:    destBucketModel.ID,
-		Key:         destKey,
-		Size:        info.Size,
-		ContentType: destContentType,
-		ETag:        info.ETag,
-		SHA256:      srcObj.SHA256,
-		StoragePath: destKey,
-		Metadata:    mapToJSONPtr(destMeta),
-		Tags:        mapToJSONPtr(destTags),
-		VersionID:   newCurrentVersionID(&destBucketModel),
+		BucketID:           destBucketModel.ID,
+		Key:                destKey,
+		Size:               info.Size,
+		ContentType:        destContentType,
+		ContentDisposition: destDisposition,
+		CacheControl:       destCacheControl,
+		ETag:               info.ETag,
+		SHA256:             srcObj.SHA256,
+		StoragePath:        destKey,
+		Metadata:           mapToJSONPtr(destMeta),
+		Tags:               mapToJSONPtr(destTags),
+		VersionID:          newCurrentVersionID(&destBucketModel),
 	}
 	if sameObject {
 		destObj.CreatedAt = srcObj.CreatedAt
