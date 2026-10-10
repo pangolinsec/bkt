@@ -2,6 +2,8 @@ package api
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -12,6 +14,24 @@ import (
 
 	"github.com/google/uuid"
 )
+
+func TestLocalRootIdentityRecoversAfterInterruptedTempWrite(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".bkt-root-id-tmp-interrupted"), []byte("partial"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	id, err := ensureLocalRootIdentity(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		t.Fatalf("invalid root identity %q: %v", id, err)
+	}
+	again, err := ensureLocalRootIdentity(root)
+	if err != nil || again != id {
+		t.Fatalf("identity was not durable: %q %q %v", id, again, err)
+	}
+}
 
 func reconcileRows(n int, age time.Duration, now time.Time) []models.Object {
 	rows := make([]models.Object, n)

@@ -107,13 +107,14 @@ func (s *S3Configuration) BeforeCreate(tx *gorm.DB) error {
 
 // Bucket represents a storage bucket
 type Bucket struct {
-	ID             uuid.UUID  `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
-	Name           string     `gorm:"uniqueIndex;not null" json:"name"`
-	OwnerID        uuid.UUID  `gorm:"type:uuid;not null;index" json:"owner_id"`
-	IsPublic       bool       `gorm:"default:false" json:"is_public"`
-	Region         string     `gorm:"default:'us-east-1'" json:"region"`
-	StorageBackend string     `gorm:"default:'local'" json:"storage_backend"`  // "local" or "s3"
-	S3ConfigID     *uuid.UUID `gorm:"type:uuid" json:"s3_config_id,omitempty"` // Optional: specific S3 config to use
+	ID              uuid.UUID  `gorm:"type:uuid;primary_key;default:gen_random_uuid()" json:"id"`
+	Name            string     `gorm:"uniqueIndex;not null" json:"name"`
+	OwnerID         uuid.UUID  `gorm:"type:uuid;not null;index" json:"owner_id"`
+	IsPublic        bool       `gorm:"default:false" json:"is_public"`
+	Region          string     `gorm:"default:'us-east-1'" json:"region"`
+	StorageBackend  string     `gorm:"default:'local'" json:"storage_backend"`  // "local" or "s3"
+	S3ConfigID      *uuid.UUID `gorm:"type:uuid" json:"s3_config_id,omitempty"` // Optional: specific S3 config to use
+	S3RouteIdentity string     `gorm:"not null;default:''" json:"-"`            // Fingerprint of the upstream route fixed when the bucket is linked.
 	// Versioning state: "" (never enabled), "enabled", or "suspended".
 	// Suspended keeps existing versions browsable but stops creating new ones
 	// (a documented simplification of AWS's null-version semantics).
@@ -158,6 +159,16 @@ type Bucket struct {
 	Owner    User             `gorm:"foreignKey:OwnerID" json:"owner,omitempty"`
 	Objects  []Object         `gorm:"foreignKey:BucketID" json:"objects,omitempty"`
 	S3Config *S3Configuration `gorm:"foreignKey:S3ConfigID" json:"s3_config,omitempty"`
+}
+
+// LocalBucketCleanup keeps local bytes discoverable after bucket metadata is
+// removed. A failed filesystem cleanup can be retried without linking those
+// bytes to a newly created bucket with the same name.
+type LocalBucketCleanup struct {
+	ID           uuid.UUID `gorm:"type:uuid;primaryKey"`
+	Name         string    `gorm:"uniqueIndex;not null"`
+	RootPath     string    `gorm:"not null"`
+	RootIdentity string    `gorm:"not null"`
 }
 
 func (b *Bucket) BeforeCreate(tx *gorm.DB) error {

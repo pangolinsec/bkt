@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -93,6 +94,43 @@ func TestLocalBucketLifecycle(t *testing.T) {
 	}
 	if ok, _ := ls.BucketExists("nb"); ok {
 		t.Error("deleted bucket still exists")
+	}
+}
+
+func TestDeleteBucketRequiresDurableParentSync(t *testing.T) {
+	ls := newTestLocal(t)
+	if err := ls.CreateBucket("sync-test", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := ls.PutObject("sync-test", "old", bytes.NewReader([]byte("old")), 3, "text/plain", nil); err != nil {
+		t.Fatal(err)
+	}
+	parent := filepath.Join(ls.rootPath, ".objects")
+	var syncs int
+	ls.syncDir = func(path string) error {
+		if path == parent {
+			syncs++
+			return errors.New("injected parent fsync failure")
+		}
+		return syncLocalDirectory(path)
+	}
+	if err := ls.DeleteBucket("sync-test"); err == nil {
+		t.Fatal("DeleteBucket accepted unsynced directory removal")
+	}
+	if syncs != 1 {
+		t.Fatalf("expected parent sync attempt, got %d", syncs)
+	}
+	ls.syncDir = func(path string) error {
+		if path == parent {
+			syncs++
+		}
+		return syncLocalDirectory(path)
+	}
+	if err := ls.DeleteBucket("sync-test"); err != nil {
+		t.Fatalf("retry did not sync absent bucket name: %v", err)
+	}
+	if syncs != 2 {
+		t.Fatalf("retry skipped durability sync after prior failure: %d", syncs)
 	}
 }
 

@@ -145,6 +145,15 @@ func (h *S3APIHandler) CreateMultipartUpload(c *gin.Context) {
 		h.s3Error(c, "NoSuchBucket", "The specified bucket does not exist", bucketName, http.StatusNotFound)
 		return
 	}
+	// Hold the bucket's shared side through upstream initiation and the
+	// tracking-row insert. Otherwise bucket deletion can pass its empty check
+	// between those two operations and leave an untracked live upload behind.
+	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), &bucket, objectKey)
+	if lockErr != nil {
+		h.s3Error(c, "NoSuchBucket", "Bucket is unavailable for multipart initiation", bucketName, http.StatusConflict)
+		return
+	}
+	defer unlock()
 
 	contentType := c.GetHeader("Content-Type")
 	if contentType == "" {

@@ -101,6 +101,9 @@ func provisionOneBucket(s3Backend storage.StorageBackend, ownerID uuid.UUID, nam
 		StorageBackend: "s3",
 		Region:         region,
 	}
+	if concrete, ok := s3Backend.(*storage.S3Storage); ok {
+		bucket.S3RouteIdentity = concrete.RouteIdentity()
+	}
 	if err := DB.Create(&bucket).Error; err != nil {
 		log.Printf("⚠️  S3 bucket %q: failed to register in database: %v", name, err)
 		return

@@ -1011,6 +1011,10 @@ func (h *S3APIHandler) DeleteObject(c *gin.Context) {
 		h.s3Error(c, "InternalError", "Failed to delete object metadata", objectKey, http.StatusInternalServerError)
 		return
 	}
+	if err := deleteLegacyCurrentAfterCommit(storageBackend, &bucket, &object); err != nil {
+		h.s3Error(c, "InternalError", err.Error(), objectKey, http.StatusInternalServerError)
+		return
+	}
 	notifyObjectEvent(&bucket, services.EventObjectRemoved, objectKey, 0, "", "")
 
 	c.Header("x-amz-request-id", uuid.New().String())
@@ -1469,6 +1473,9 @@ func (h *S3APIHandler) deleteOneForBatch(ctx context.Context, storageBackend sto
 	}
 	if err := database.DB.Delete(&dbObj).Error; err != nil {
 		return DeletedObject{}, &DeleteError{Key: key, Code: "InternalError", Message: "Failed to delete object metadata"}
+	}
+	if err := deleteLegacyCurrentAfterCommit(storageBackend, bucket, &dbObj); err != nil {
+		return DeletedObject{}, &DeleteError{Key: key, Code: "InternalError", Message: err.Error()}
 	}
 	notifyObjectEvent(bucket, services.EventObjectRemoved, key, 0, "", "")
 	return DeletedObject{Key: key}, nil

@@ -812,7 +812,8 @@ Mints a short-lived S3 access key pair for the caller. Temporary keys are **excl
 ```
 
 **Error Codes:**
-- `409` - Bucket not empty
+- `409` - S3 bucket not empty or its stored upstream route cannot be verified (including buckets created before route pinning)
+- `500` - Upstream deletion or local filesystem cleanup failed; local cleanup is retried on startup
 
 </details>
 

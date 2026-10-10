@@ -2,6 +2,9 @@ package storage
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,13 +19,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 // S3Storage implements StorageBackend using S3-compatible storage
 type S3Storage struct {
-	client       *s3.Client
-	bucketPrefix string
-	sse          bool // request SSE-S3 (AES256) on every write
+	client        *s3.Client
+	bucketPrefix  string
+	routeIdentity string
+	sse           bool // request SSE-S3 (AES256) on every write
 }
 
 // NewS3Storage creates a new S3 storage backend
@@ -53,11 +58,25 @@ func NewS3Storage(endpoint, region, accessKeyID, secretAccessKey, bucketPrefix s
 	})
 
 	return &S3Storage{
-		client:       client,
-		bucketPrefix: bucketPrefix,
-		sse:          sse,
+		client:        client,
+		bucketPrefix:  bucketPrefix,
+		routeIdentity: S3RouteIdentity(endpoint, region, accessKeyID, bucketPrefix, useSSL, forcePathStyle),
+		sse:           sse,
 	}, nil
 }
+
+// S3RouteIdentity fingerprints the configured route and access-key identity.
+// Secret-key rotation for the same access key does not change the route.
+func S3RouteIdentity(endpoint, region, accessKeyID, bucketPrefix string, useSSL, forcePathStyle bool) string {
+	encoded, _ := json.Marshal(struct {
+		Endpoint, Region, AccessKeyID, BucketPrefix string
+		UseSSL, ForcePathStyle                      bool
+	}{endpoint, region, accessKeyID, bucketPrefix, useSSL, forcePathStyle})
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:])
+}
+
+func (s3s *S3Storage) RouteIdentity() string { return s3s.routeIdentity }
 
 // Upstream call deadlines. Non-streaming calls (HEAD, DELETE, list pages,
 // multipart bookkeeping) get s3MetadataTimeout so a hung upstream cannot pin a
@@ -148,6 +167,101 @@ func (s3s *S3Storage) DeleteBucket(bucketName string) error {
 	}
 
 	return nil
+}
+
+// IsS3BucketNotEmpty reports an upstream BucketNotEmpty refusal. The
+// caller may reclaim unreferenced bytes only after checking its metadata has
+// no live objects, content versions, or in-progress uploads.
+func IsS3BucketNotEmpty(err error) bool {
+	var apiErr smithy.APIError
+	return s3HTTPStatus(err) == 409 && errors.As(err, &apiErr) && apiErr.ErrorCode() == "BucketNotEmpty"
+}
+
+// IsS3BucketNotFound recognizes a bucket already removed by an earlier attempt
+// whose following database transaction failed. The caller must still verify
+// that no metadata refers to live bytes before completing that transaction.
+func IsS3BucketNotFound(err error) bool {
+	var apiErr smithy.APIError
+	return s3HTTPStatus(err) == 404 && errors.As(err, &apiErr) && apiErr.ErrorCode() == "NoSuchBucket"
+}
+
+var (
+	ErrS3BucketContainsPublicObjects = errors.New("S3 bucket contains objects outside BKT's hidden storage prefixes")
+	ErrS3BucketUsesNativeVersioning  = errors.New("S3 bucket has native versioning; delete upstream versions before removing it")
+)
+
+func isBKTPhysicalKey(key string) bool {
+	return strings.HasPrefix(key, ".bkt-generations/") || strings.HasPrefix(key, ".bkt-versions/")
+}
+
+// EmptyBucket reclaims only BKT's hidden physical keys after callers prove no
+// metadata still refers to bytes. Public keys may be written out of band and
+// must never be swept. Native S3 versioning also needs explicit upstream
+// version deletion; an unversioned DeleteObject would only create a marker.
+func (s3s *S3Storage) EmptyBucket(bucketName string) error {
+	actualBucketName := s3s.getBucketName(bucketName)
+	ctx, cancel := s3MetaCtx()
+	versioning, err := s3s.client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(actualBucketName)})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("check upstream bucket versioning: %w", err)
+	}
+	if versioning.Status != "" {
+		return ErrS3BucketUsesNativeVersioning
+	}
+	// Scan the complete inventory before removing anything. An out-of-band
+	// public key can be absent from BKT's metadata but still be live data.
+	paginator := s3.NewListObjectsV2Paginator(s3s.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(actualBucketName), MaxKeys: aws.Int32(1000),
+	})
+	for paginator.HasMorePages() {
+		ctx, cancel := s3MetaCtx()
+		page, err := paginator.NextPage(ctx)
+		cancel()
+		if err != nil {
+			return fmt.Errorf("list bucket before orphan cleanup: %w", err)
+		}
+		for _, object := range page.Contents {
+			if !isBKTPhysicalKey(aws.ToString(object.Key)) {
+				return ErrS3BucketContainsPublicObjects
+			}
+		}
+	}
+	// Start each page from the beginning so deleting keys does not skip later
+	// objects as the listing changes. Re-check every key before deletion.
+	previousFirstKey := ""
+	for {
+		ctx, cancel := s3MetaCtx()
+		page, err := s3s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket: aws.String(actualBucketName), MaxKeys: aws.Int32(1000),
+		})
+		cancel()
+		if err != nil {
+			return fmt.Errorf("list bucket before emptying: %w", err)
+		}
+		if len(page.Contents) == 0 {
+			return nil
+		}
+		firstKey := aws.ToString(page.Contents[0].Key)
+		if firstKey == previousFirstKey {
+			return fmt.Errorf("bucket listing did not advance after deleting %q", firstKey)
+		}
+		previousFirstKey = firstKey
+		for _, object := range page.Contents {
+			key := aws.ToString(object.Key)
+			if !isBKTPhysicalKey(key) {
+				return ErrS3BucketContainsPublicObjects
+			}
+			ctx, cancel := s3MetaCtx()
+			_, err := s3s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+				Bucket: aws.String(actualBucketName), Key: aws.String(key),
+			})
+			cancel()
+			if err != nil {
+				return fmt.Errorf("delete unreferenced bucket object %q: %w", key, err)
+			}
+		}
+	}
 }
 
 // BucketExists checks if a bucket exists and is accessible in S3

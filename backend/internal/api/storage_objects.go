@@ -295,17 +295,31 @@ func tryLockObjectKeysChecked(bucket *models.Bucket, timeout time.Duration, keys
 }
 
 func lockBucketExclusive(ctx context.Context, bucket *models.Bucket) (func(), error) {
+	unlock, err := lockBucketName(ctx, bucket.Name)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateLockedBuckets(ctx, bucket); err != nil {
+		unlock()
+		return nil, err
+	}
+	return unlock, nil
+}
+
+// lockBucketName serializes bucket creation, deletion, and deferred local
+// cleanup across replicas. Callers must re-read rows after acquiring it.
+func lockBucketName(ctx context.Context, name string) (func(), error) {
 	if database.AdvisoryDB == nil {
-		return nil, fmt.Errorf("bucket deletion lock: advisory database not initialized")
+		return nil, fmt.Errorf("bucket name lock: advisory database not initialized")
 	}
 	conn, err := database.AdvisoryDB.Conn(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("bucket deletion lock: connection: %w", err)
+		return nil, fmt.Errorf("bucket name lock: connection: %w", err)
 	}
-	key := advisoryBucketKey(bucket.Name)
+	key := advisoryBucketKey(name)
 	if err := acquireAdvisory(ctx, conn, key, false); err != nil {
 		discardAdvisoryConn(conn)
-		return nil, fmt.Errorf("bucket deletion lock: acquire: %w", err)
+		return nil, fmt.Errorf("bucket name lock: acquire: %w", err)
 	}
 	var once sync.Once
 	unlock := func() {
@@ -313,10 +327,6 @@ func lockBucketExclusive(ctx context.Context, bucket *models.Bucket) (func(), er
 			unlockAdvisory(conn, []advisoryHold{{key: key}})
 			_ = conn.Close()
 		})
-	}
-	if err := validateLockedBuckets(ctx, bucket); err != nil {
-		unlock()
-		return nil, err
 	}
 	return unlock, nil
 }
