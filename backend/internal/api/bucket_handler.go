@@ -54,6 +54,8 @@ type BucketHandler struct {
 	config        *config.Config
 	policyService *services.PolicyService
 	auditService  *services.AuditService
+	// Test observer for the asynchronous S3 listing import. Nil in production.
+	reconcileImportDone func()
 }
 
 func NewBucketHandler(cfg *config.Config) *BucketHandler {
@@ -1223,8 +1225,12 @@ func (h *BucketHandler) ListObjects(c *gin.Context) {
 				// Add new objects to database in background using batch inserts
 				// Batch size of 100 balances memory usage vs query count
 				const batchSize = 100
+				importDone := h.reconcileImportDone
 				if len(newObjects) > 0 {
 					go func(objs []models.Object) {
+						if importDone != nil {
+							defer importDone()
+						}
 						// Process in batches to avoid huge queries
 						for i := 0; i < len(objs); i += batchSize {
 							end := i + batchSize
@@ -1260,6 +1266,8 @@ func (h *BucketHandler) ListObjects(c *gin.Context) {
 							objects = append(objects, obj)
 						}
 					}
+				} else if importDone != nil {
+					importDone()
 				}
 
 				// Prune stale rows in the background, each under its key's
