@@ -101,3 +101,32 @@ func TestIntegrationS3PutCommitsImmutableCurrentAndHistory(t *testing.T) {
 		t.Errorf("archived bytes: %d %q", w.Code, w.Body.String())
 	}
 }
+
+func TestIntegrationS3PutArchivesLegacyCurrentWithoutMovingCommittedBytes(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-legacy"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) { b.Versioning = models.VersioningEnabled })
+	backend := storage.NewLocalStorage(cfg.Storage.RootPath)
+	if err := backend.PutObject(bucket.Name, "key", strings.NewReader("legacy"), 6, "text/plain", nil); err != nil {
+		t.Fatal(err)
+	}
+	info, err := backend.GetObjectInfo(bucket.Name, "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := upsertCurrentObject(&models.Object{BucketID: bucket.ID, Key: "key", Size: 6, ETag: info.ETag, ContentType: "text/plain", StoragePath: "key"}); err != nil {
+		t.Fatal(err)
+	}
+	router := itS3Router(cfg, owner)
+	s3PutString(t, router, bucket.Name, "key", "replacement")
+	var archived models.ObjectVersion
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&archived).Error; err != nil {
+		t.Fatal(err)
+	}
+	if archived.GenerationID == "" {
+		t.Fatal("legacy current was archived without an immutable generation")
+	}
+	if w := itDo(router, http.MethodGet, "/"+bucket.Name+"/key?versionId="+archived.VersionID, nil); w.Code != http.StatusOK || w.Body.String() != "legacy" {
+		t.Errorf("archived legacy bytes: %d %q", w.Code, w.Body.String())
+	}
+}
