@@ -28,8 +28,8 @@ func checkS3UserKey(objectKey string) error {
 	if objectKey == "" {
 		return fmt.Errorf("invalid empty object key")
 	}
-	if strings.HasPrefix(objectKey, s3VersionPrefix) {
-		return fmt.Errorf("object keys under %q are reserved", s3VersionPrefix)
+	if strings.HasPrefix(objectKey, s3VersionPrefix) || strings.HasPrefix(objectKey, s3GenerationPrefix) {
+		return fmt.Errorf("object key is under a reserved bkt prefix")
 	}
 	return nil
 }

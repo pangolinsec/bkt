@@ -95,11 +95,14 @@ func ValidateObjectKey(key string) error {
 // User keys under it would read, overwrite or delete version bytes directly.
 const ReservedObjectKeyPrefix = ".bkt-versions/"
 
+// ReservedGenerationKeyPrefix is the hidden S3 storage for immutable blobs.
+const ReservedGenerationKeyPrefix = ".bkt-generations/"
+
 // IsReservedObjectKey reports whether key lies in bkt's internal keyspace.
 // Read and delete paths use it (in addition to write paths via
 // ValidateObjectKey) so internal data can never be addressed as an object.
 func IsReservedObjectKey(key string) bool {
-	return strings.HasPrefix(key, ReservedObjectKeyPrefix)
+	return strings.HasPrefix(key, ReservedObjectKeyPrefix) || strings.HasPrefix(key, ReservedGenerationKeyPrefix)
 }
 
 // ValidateIPAddress checks if a string is a valid IP address

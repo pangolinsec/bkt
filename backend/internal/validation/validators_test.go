@@ -59,6 +59,8 @@ func TestValidateObjectKeyRejectsReservedVersionKeyspace(t *testing.T) {
 		".bkt-versions/",
 		".bkt-versions/a",
 		".bkt-versions/a/0b0c3b51-0000-4000-8000-000000000000",
+		".bkt-generations/",
+		".bkt-generations/aa/0b0c3b51-0000-4000-8000-000000000000",
 	} {
 		if err := ValidateObjectKey(k); err == nil {
 			t.Errorf("ValidateObjectKey(%q) = nil, want reserved-key error", k)

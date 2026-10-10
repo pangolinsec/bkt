@@ -182,6 +182,12 @@ func TestS3ReservedPrefixMatchesValidation(t *testing.T) {
 	if s3VersionPrefix != validation.ReservedObjectKeyPrefix {
 		t.Fatalf("storage version prefix %q != validation reserved prefix %q", s3VersionPrefix, validation.ReservedObjectKeyPrefix)
 	}
+	if s3GenerationPrefix != validation.ReservedGenerationKeyPrefix {
+		t.Fatalf("storage generation prefix %q != validation reserved prefix %q", s3GenerationPrefix, validation.ReservedGenerationKeyPrefix)
+	}
+	if err := checkS3UserKey(".bkt-generations/a/b"); err == nil {
+		t.Error("checkS3UserKey accepted a generation key")
+	}
 	if err := checkS3UserKey(".bkt-versions/a/b"); err == nil {
 		t.Error("checkS3UserKey accepted a reserved key")
 	}

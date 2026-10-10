@@ -322,7 +322,7 @@ func (s3s *S3Storage) ListObjects(bucketName, prefix string) ([]ObjectInfo, erro
 			}
 			// Hide bkt-managed version storage from listings — these keys are
 			// version bytes, not objects (and reconcile must never see them).
-			if strings.HasPrefix(aws.ToString(obj.Key), s3VersionPrefix) {
+			if strings.HasPrefix(aws.ToString(obj.Key), s3VersionPrefix) || strings.HasPrefix(aws.ToString(obj.Key), s3GenerationPrefix) {
 				continue
 			}
 			// Infer content type from file extension (avoids N+1 HeadObject calls)
