@@ -1,22 +1,24 @@
 # Immutable object generations: crash-consistency work inventory
 
-Status: **release blocker**. The tests in `object_replica_integration_pg_test.go`
-and `object_generation_integration_pg_test.go` expose committed metadata pointing
-to different bytes after a writer dies between a filesystem operation and a
-database update. The cross-replica advisory-lock work prevents concurrent
-mutations; it does not make one mutation atomic across PostgreSQL and storage.
+Status: **release blocker**. The original crash diagnostics in
+`object_replica_integration_pg_test.go` and
+`object_generation_integration_pg_test.go` now pass for the production S3
+PUT/copy/delete/restore and local multipart paths they exercise. This is a
+scoped checkpoint, not a provider parity result: the remaining console,
+lifecycle, replication, reconciliation, legacy migration, and reader-lifetime
+paths below still need implementation and crash tests. The cross-replica
+advisory locks prevent concurrent mutations but cannot make PostgreSQL and
+storage one atomic system.
 
 ## Current commit boundary
 
-`objects` holds the current object metadata and a `storage_path` field, but
-every current read uses the public `key` to open bytes. Writers also set
-`storage_path = key`. Local storage replaces the blob at that key with a
-same-directory rename. Its rename is atomic as a filesystem operation; the
-subsequent metadata upsert is a separate PostgreSQL transaction. A crash in
-the gap leaves new bytes under the old ETag. Delete and version archive have
-the inverse failure: they remove or move the bytes while the old row still
-claims to be current. PostgreSQL locks serialize replicas but cannot close
-this cross-system transaction gap.
+Legacy `objects` rows name a mutable public-key blob. New S3 API PUT, copy,
+multipart completion, and restore paths stage create-only bytes under a
+`generation_id`, then commit the current pointer and any archived version row
+in one PostgreSQL transaction. Current and historical S3 reads resolve that
+pointer. The original gap remains wherever a writer still replaces, moves,
+or deletes public-key bytes before its metadata commit. A crash there can
+serve new bytes under an old ETag or leave a live row without bytes.
 
 ## Complete path inventory
 
@@ -64,20 +66,22 @@ this cross-system transaction gap.
    generation; it must not destroy the legacy blob before commit. Backfill
    and garbage collection need separate migration and rollback tests.
 
-## Red diagnostic gates as of this branch
+## Diagnostic checkpoint on `3f3ddf1`
 
-- `TestIntegrationCrashBetweenBytesAndMetadata`: in-place PUT serves
-  `new-bytes` under the committed old ETag.
-- `TestIntegrationGenerationCrashCopy`: copy replacement serves source bytes
-  under the committed destination ETag.
-- `TestIntegrationGenerationCrashDelete`: byte-first delete leaves a live row
-  whose GET returns 500.
-- `TestIntegrationGenerationCrashRange`: range GET serves a partial new blob
-  under the old ETag.
-- `TestIntegrationGenerationCrashArchive`: version archive moves the current
-  blob and inserts a history row before the replacement commits.
-- `TestIntegrationGenerationCrashRestore`: restore writes historical bytes
-  under the still-current metadata and adds an uncommitted history row.
+- The original six subprocess diagnostics above are green. Each child enters
+  a production route, exits at the storage/metadata boundary, and a fresh
+  reader verifies the committed bytes and ETag.
+- `TestIntegrationGenerationCrashMultipart` is green for local storage: a
+  completed immutable blob remains invisible if the writer dies before the
+  metadata transaction.
+- `TestIntegrationS3MultipartPublishesHiddenGeneration` checks a real API
+  route against a fake S3 upstream: initiate, part upload, and complete target
+  a hidden generation, completion is create-only, and the previous version
+  remains readable. `TestIntegrationS3PutStreamsIntoHiddenGeneration` checks
+  the corresponding normal PUT path.
+- The exact PostgreSQL-backed `go test -count=1 ./...` run passed after these
+  increments. This suite does not yet exercise every mutation in the path
+  inventory or prove safe reclamation of generations held by live readers.
 
 The diagnostic subprocesses force exits at storage/metadata boundaries. As
 implementation paths change, move the hooks to the actual production commit
