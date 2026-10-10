@@ -146,9 +146,8 @@ func (ls *LocalStorage) CompleteMultipartGeneration(bucketName, objectKey, gener
 	if err != nil {
 		return nil, err
 	}
-	// Cleanup is best effort after the durable blob has been published. A
-	// staging directory left behind is handled by the abandoned-upload sweep.
-	_ = os.RemoveAll(dir)
+	// Keep the parts until the caller commits the metadata pointer. A crash
+	// or transaction failure can then retry assembly with a fresh generation.
 	return info, nil
 }
 

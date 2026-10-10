@@ -66,19 +66,35 @@ serve new bytes under an old ETag or leave a live row without bytes.
    generation; it must not destroy the legacy blob before commit. Backfill
    and garbage collection need separate migration and rollback tests.
 
-## Diagnostic checkpoint on `3f3ddf1`
+## Diagnostic checkpoint on this branch
 
 - The original six subprocess diagnostics above are green. Each child enters
   a production route, exits at the storage/metadata boundary, and a fresh
   reader verifies the committed bytes and ETag.
 - `TestIntegrationGenerationCrashMultipart` is green for local storage: a
   completed immutable blob remains invisible if the writer dies before the
-  metadata transaction.
+  metadata transaction. The same tracked upload and its parts remain
+  available for a retry after the subprocess exits.
 - `TestIntegrationS3MultipartPublishesHiddenGeneration` checks a real API
   route against a fake S3 upstream: initiate, part upload, and complete target
   a hidden generation, completion is create-only, and the previous version
-  remains readable. `TestIntegrationS3PutStreamsIntoHiddenGeneration` checks
-  the corresponding normal PUT path.
+  remains readable. It also retries after upstream Complete succeeds and the
+  API stops before the metadata transaction. Tracking status, current pointer,
+  and version history commit together; a forced tracking failure rolls all
+  three back. Local completion rejects a wrong part ETag and serializes part
+  replacement with completion. `TestIntegrationS3PutStreamsIntoHiddenGeneration`
+  checks the corresponding normal PUT path.
+- S3-backed generation PUTs and multipart parts use a seekable scratch file
+  for HTTP request signing. On Unix the file is unlinked immediately, and on
+  Linux the declared byte count is
+  reserved before reading the client body; insufficient scratch capacity
+  rejects the write without changing a committed object. Set
+  `BKT_S3_GENERATION_SPOOL_DIR` to an existing dedicated directory when `/tmp`
+  cannot hold the maximum simultaneous uploads. The default per-request limit
+  is 5 GiB, so capacity planning must account for concurrent writers. The
+  unlinked file is reclaimed by the kernel when a process dies. Windows
+  removes the named file after a normal upload; crash cleanup there remains
+  a platform limitation.
 - The exact PostgreSQL-backed `go test -count=1 ./...` run passed after these
   increments. This suite does not yet exercise every mutation in the path
   inventory or prove safe reclamation of generations held by live readers.

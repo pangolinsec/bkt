@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"gorm.io/gorm"
 )
 
 // Multipart XML types
@@ -76,6 +77,11 @@ type MultipartUploadEntry struct {
 	Initiated    time.Time `xml:"Initiated"`
 	StorageClass string    `xml:"StorageClass"`
 }
+
+// A NUL byte cannot occur in a public object key, so this advisory identity
+// cannot collide with an object writer's lock. It serializes part replacement,
+// listing, abort, and completion for one upload across replicas.
+func multipartLockKey(uploadID string) string { return "\x00multipart-upload/" + uploadID }
 
 type CopyPartResult struct {
 	XMLName      xml.Name  `xml:"CopyPartResult"`
@@ -247,6 +253,10 @@ func (h *S3APIHandler) authorizeMultipartUpload(c *gin.Context, bucketName, obje
 		h.s3Error(c, "AccessDenied", "Access Denied", objectKey, http.StatusForbidden)
 		return nil, nil, false
 	}
+	if mpu.Status != "in-progress" {
+		h.s3Error(c, "NoSuchUpload", "The specified upload is no longer in progress", uploadID, http.StatusNotFound)
+		return nil, nil, false
+	}
 
 	// Enforce the object-level policy for the action.
 	if allowed, err := h.policyService.CheckObjectAccess(userUUID, mpu.BucketName, mpu.ObjectKey, action); err != nil || !allowed {
@@ -261,6 +271,19 @@ func (h *S3APIHandler) authorizeMultipartUpload(c *gin.Context, bucketName, obje
 	}
 
 	return &mpu, &bucket, true
+}
+
+// Authorization happens before the advisory wait. Completion or abort may
+// commit while a second request waits, so verify the upload is still active
+// after acquiring its upload lock and before touching parts.
+func (h *S3APIHandler) requireActiveMultipartUnderLock(c *gin.Context, mpu *models.MultipartUpload) bool {
+	var fresh models.MultipartUpload
+	if err := database.DB.Where("id = ? AND upload_id = ? AND status = ?", mpu.ID, mpu.UploadID, "in-progress").First(&fresh).Error; err != nil {
+		h.s3Error(c, "NoSuchUpload", "The specified upload is no longer in progress", mpu.UploadID, http.StatusNotFound)
+		return false
+	}
+	*mpu = fresh
+	return true
 }
 
 // UploadPart handles PUT /{bucket}/{key}?partNumber=N&uploadId=X
@@ -284,6 +307,15 @@ func (h *S3APIHandler) UploadPart(c *gin.Context) {
 	storageBackend, err := h.bucketHandler.getStorageBackend(bucket)
 	if err != nil {
 		h.s3Error(c, "InternalError", "Failed to initialize storage", objectKey, http.StatusInternalServerError)
+		return
+	}
+	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), bucket, multipartLockKey(uploadID))
+	if lockErr != nil {
+		h.s3Error(c, "InternalError", "Failed to lock multipart upload", objectKey, http.StatusInternalServerError)
+		return
+	}
+	defer unlock()
+	if !h.requireActiveMultipartUnderLock(c, mpu) {
 		return
 	}
 
@@ -366,15 +398,35 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 	}
 
 	// Serialize with other writers of the target key.
-	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), bucket, mpu.ObjectKey)
+	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), bucket, mpu.ObjectKey, multipartLockKey(uploadID))
 	if lockErr != nil {
 		h.s3Error(c, "InternalError", "Failed to lock object", mpu.ObjectKey, http.StatusInternalServerError)
 		return
 	}
 	defer unlock()
+	if !h.requireActiveMultipartUnderLock(c, mpu) {
+		return
+	}
 	hadPrior, ok := h.checkWritePreconditions(c, bucket, mpu.ObjectKey)
 	if !ok {
 		return
+	}
+	if _, local := storageBackend.(*storage.LocalStorage); local {
+		actual, listErr := storageBackend.ListParts(mpu.BucketName, mpu.ObjectKey, uploadID)
+		if listErr != nil {
+			h.s3Error(c, "NoSuchUpload", "The specified upload does not exist", uploadID, http.StatusNotFound)
+			return
+		}
+		byNumber := make(map[int]string, len(actual))
+		for _, part := range actual {
+			byNumber[part.PartNumber] = part.ETag
+		}
+		for _, part := range parts {
+			if part.ETag == "" || byNumber[part.PartNumber] != part.ETag {
+				h.s3Error(c, "InvalidPart", fmt.Sprintf("Part %d ETag does not match", part.PartNumber), objectKey, http.StatusBadRequest)
+				return
+			}
+		}
 	}
 
 	// Quota: the assembled object's size is the sum of the listed parts. On
@@ -384,6 +436,7 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 	// quota the upstream CompleteMultipartUpload validates the parts itself.
 	// Local listings are free and keep the precise InvalidPart error.
 	var assembledSize int64
+	var completedInfo *storage.ObjectInfo
 	if bucket.QuotaBytes > 0 || bucket.StorageBackend != "s3" {
 		var partSizes map[int]int64
 		if s3Backend, ok := storageBackend.(*storage.S3Storage); ok {
@@ -396,19 +449,32 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 			partSizes, err = storage.PartSizes(storageBackend, mpu.BucketName, mpu.ObjectKey, uploadID)
 		}
 		if err != nil {
+			if s3Backend, ok := storageBackend.(*storage.S3Storage); ok && mpu.GenerationID != "" {
+				// An earlier Complete may have succeeded upstream before the
+				// metadata transaction failed. Its parts no longer list, but
+				// its hidden generation has an authoritative size for quota.
+				completedInfo, _ = s3Backend.GenerationInfo(mpu.BucketName, mpu.ObjectKey, mpu.GenerationID)
+			}
+		}
+		if err != nil && completedInfo == nil {
 			h.s3Error(c, "InternalError", "Failed to list uploaded parts", uploadID, http.StatusInternalServerError)
 			return
 		}
-		seenParts := make(map[int]bool, len(parts))
-		for _, p := range parts {
-			sz, ok := partSizes[p.PartNumber]
-			if !ok {
-				h.s3Error(c, "InvalidPart", fmt.Sprintf("Part %d has not been uploaded", p.PartNumber), objectKey, http.StatusBadRequest)
-				return
-			}
-			if !seenParts[p.PartNumber] {
-				seenParts[p.PartNumber] = true
-				assembledSize += sz
+		if completedInfo != nil {
+			err = nil
+			assembledSize = completedInfo.Size
+		} else {
+			seenParts := make(map[int]bool, len(parts))
+			for _, p := range parts {
+				sz, ok := partSizes[p.PartNumber]
+				if !ok {
+					h.s3Error(c, "InvalidPart", fmt.Sprintf("Part %d has not been uploaded", p.PartNumber), objectKey, http.StatusBadRequest)
+					return
+				}
+				if !seenParts[p.PartNumber] {
+					seenParts[p.PartNumber] = true
+					assembledSize += sz
+				}
 			}
 		}
 	}
@@ -424,10 +490,7 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 	if local, ok := storageBackend.(*storage.LocalStorage); ok {
 		// Local parts live in a private staging directory. Assemble directly
 		// into immutable storage so old readers retain their selected bytes.
-		generationID = mpu.GenerationID
-		if generationID == "" { // in-flight local upload from before the additive column
-			generationID = uuid.NewString()
-		}
+		generationID = uuid.NewString() // a previous failed attempt may have staged the recorded ID
 		objInfo, err = local.CompleteMultipartGeneration(mpu.BucketName, mpu.ObjectKey, generationID, uploadID, parts)
 		if err != nil {
 			h.s3Error(c, "InternalError", "Failed to complete multipart upload", objectKey, http.StatusInternalServerError)
@@ -440,7 +503,10 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 			return
 		}
 		generationID = mpu.GenerationID
-		objInfo, err = s3Backend.CompleteGenerationMultipartUpload(mpu.BucketName, mpu.ObjectKey, generationID, uploadID, parts)
+		objInfo = completedInfo
+		if objInfo == nil {
+			objInfo, err = s3Backend.CompleteGenerationMultipartUpload(mpu.BucketName, mpu.ObjectKey, generationID, uploadID, parts)
+		}
 		if err != nil {
 			h.s3Error(c, "InternalError", "Failed to complete multipart upload", objectKey, http.StatusInternalServerError)
 			return
@@ -482,7 +548,18 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 		VersionID:          newCurrentVersionID(bucket),
 	}
 	if generationID != "" {
-		err = commitStagedGeneration(storageBackend.(storage.GenerationStorage), bucket, &obj)
+		err = commitStagedGenerationWith(storageBackend.(storage.GenerationStorage), bucket, &obj, func(tx *gorm.DB) error {
+			result := tx.Model(&models.MultipartUpload{}).
+				Where("upload_id = ? AND status = ?", uploadID, "in-progress").
+				Update("status", "completed")
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected != 1 {
+				return fmt.Errorf("multipart tracking row is not in progress")
+			}
+			return nil
+		})
 	} else {
 		err = upsertCurrentObject(&obj)
 	}
@@ -497,8 +574,18 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 		c.Header("x-amz-version-id", obj.VersionID)
 	}
 
-	// Mark multipart upload completed
-	database.DB.Model(&models.MultipartUpload{}).Where("upload_id = ?", uploadID).Update("status", "completed")
+	// Local staging is reclaimed only after the metadata commit succeeds.
+	if generationID != "" {
+		if _, local := storageBackend.(*storage.LocalStorage); local {
+			_ = storageBackend.AbortMultipartUpload(mpu.BucketName, mpu.ObjectKey, uploadID)
+		}
+	}
+	if generationID == "" {
+		if err := database.DB.Model(&models.MultipartUpload{}).Where("upload_id = ?", uploadID).Update("status", "completed").Error; err != nil {
+			h.s3Error(c, "InternalError", "Failed to update multipart upload state", objectKey, http.StatusInternalServerError)
+			return
+		}
+	}
 
 	notifyObjectEvent(bucket, services.EventObjectCreated, mpu.ObjectKey, objInfo.Size, objInfo.ETag, obj.VersionID)
 
@@ -526,6 +613,15 @@ func (h *S3APIHandler) AbortMultipartUpload(c *gin.Context) {
 	storageBackend, err := h.bucketHandler.getStorageBackend(bucket)
 	if err != nil {
 		h.s3Error(c, "InternalError", "Failed to initialize storage", objectKey, http.StatusInternalServerError)
+		return
+	}
+	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), bucket, multipartLockKey(uploadID))
+	if lockErr != nil {
+		h.s3Error(c, "InternalError", "Failed to lock multipart upload", objectKey, http.StatusInternalServerError)
+		return
+	}
+	defer unlock()
+	if !h.requireActiveMultipartUnderLock(c, mpu) {
 		return
 	}
 
@@ -565,6 +661,15 @@ func (h *S3APIHandler) ListPartsHandler(c *gin.Context) {
 	storageBackend, err := h.bucketHandler.getStorageBackend(bucket)
 	if err != nil {
 		h.s3Error(c, "InternalError", "Failed to initialize storage", objectKey, http.StatusInternalServerError)
+		return
+	}
+	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), bucket, multipartLockKey(uploadID))
+	if lockErr != nil {
+		h.s3Error(c, "InternalError", "Failed to lock multipart upload", objectKey, http.StatusInternalServerError)
+		return
+	}
+	defer unlock()
+	if !h.requireActiveMultipartUnderLock(c, mpu) {
 		return
 	}
 
@@ -795,6 +900,15 @@ func (h *S3APIHandler) UploadPartCopy(c *gin.Context) {
 		return
 	}
 	defer partReader.Close() //nolint:errcheck // best-effort close of read stream
+	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), bucket, multipartLockKey(uploadID))
+	if lockErr != nil {
+		h.s3Error(c, "InternalError", "Failed to lock multipart upload", objectKey, http.StatusInternalServerError)
+		return
+	}
+	defer unlock()
+	if !h.requireActiveMultipartUnderLock(c, mpu) {
+		return
+	}
 
 	var etag string
 	if s3Backend, ok := destStorage.(*storage.S3Storage); ok {

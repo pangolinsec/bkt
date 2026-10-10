@@ -13,6 +13,7 @@ import (
 	"bkt/internal/config"
 	"bkt/internal/database"
 	"bkt/internal/models"
+	"bkt/internal/storage"
 )
 
 // These subprocesses enter real API handlers and exit at their storage/DB
@@ -89,6 +90,24 @@ func TestIntegrationGenerationCrashMultipart(t *testing.T) {
 	if after.Code != http.StatusOK || after.Body.String() != "old-bytes" || after.Header().Get("ETag") != before.Header().Get("ETag") {
 		t.Errorf("multipart crash exposed uncommitted bytes: status=%d body=%q ETag=%q committed ETag=%q",
 			after.Code, after.Body.String(), after.Header().Get("ETag"), before.Header().Get("ETag"))
+	}
+	// The crash must not consume the only copy of uploaded parts. The same
+	// tracked upload ID must be completable after the failed publication.
+	var upload models.MultipartUpload
+	if err := database.DB.Where("bucket_name = ? AND object_key = ? AND status = ?", bucket.Name, "dest", "in-progress").First(&upload).Error; err != nil {
+		t.Fatal(err)
+	}
+	backend := storage.NewLocalStorage(cfg.Storage.RootPath)
+	parts, err := backend.ListParts(bucket.Name, "dest", upload.UploadID)
+	if err != nil || len(parts) != 1 {
+		t.Fatalf("crashed multipart parts unavailable for retry: %+v %v", parts, err)
+	}
+	complete := []byte(fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, parts[0].ETag))
+	if w := itDo(router, http.MethodPost, "/"+bucket.Name+"/dest?uploadId="+upload.UploadID, complete); w.Code != http.StatusOK {
+		t.Fatalf("retry crashed multipart upload: %d %s", w.Code, w.Body.String())
+	}
+	if status, body := s3GetString(t, router, bucket.Name, "dest"); status != http.StatusOK || body != "new-bytes" {
+		t.Errorf("retried multipart bytes: %d %q", status, body)
 	}
 }
 

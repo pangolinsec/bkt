@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -24,6 +25,7 @@ func TestIntegrationS3MultipartPublishesHiddenGeneration(t *testing.T) {
 	bucket := itBucket(t, owner.ID, func(b *models.Bucket) {
 		b.StorageBackend = "s3"
 		b.Versioning = models.VersioningEnabled
+		b.QuotaBytes = 1024 // exercise retry after upstream ListParts is consumed
 	})
 	oldGenerationID, oldVersionID := uuid.NewString(), uuid.NewString()
 	if err := database.DB.Create(&models.Object{
@@ -33,6 +35,8 @@ func TestIntegrationS3MultipartPublishesHiddenGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	var hiddenPath string
+	completed := false
+	completeCalls := 0
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/"+bucket.Name+"/.bkt-generations/") {
 			t.Errorf("multipart touched public physical key: %s", r.URL.Path)
@@ -64,13 +68,29 @@ func TestIntegrationS3MultipartPublishesHiddenGeneration(t *testing.T) {
 			}
 			w.Header().Set("ETag", `"part-etag"`)
 		case r.Method == http.MethodPost && q.Get("uploadId") == "upstream-upload":
+			completeCalls++
+			if completed {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
 			if r.Header.Get("If-None-Match") != "*" {
 				t.Error("multipart completion lacked create-only condition")
 			}
+			completed = true
 			_, _ = w.Write([]byte(`<CompleteMultipartUploadResult><ETag>"committed-etag"</ETag></CompleteMultipartUploadResult>`))
 		case r.Method == http.MethodHead:
+			if !completed {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
 			w.Header().Set("ETag", `"committed-etag"`)
 			w.Header().Set("Content-Length", "3")
+		case r.Method == http.MethodGet && q.Get("uploadId") == "upstream-upload":
+			if completed {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_, _ = w.Write([]byte(`<ListPartsResult><IsTruncated>false</IsTruncated><Part><PartNumber>1</PartNumber><Size>3</Size><ETag>"part-etag"</ETag></Part></ListPartsResult>`))
 		case r.Method == http.MethodGet:
 			w.Header().Set("ETag", `"committed-etag"`)
 			_, _ = w.Write([]byte("new"))
@@ -103,8 +123,37 @@ func TestIntegrationS3MultipartPublishesHiddenGeneration(t *testing.T) {
 		t.Fatalf("part: %d %s", part.Code, part.Body.String())
 	}
 	complete := []byte(fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, part.Header().Get("ETag")))
+	priorHook := generationCommitBoundary
+	defer func() { generationCommitBoundary = priorHook }()
+	generationCommitBoundary = func(boundary string) {
+		if boundary == "multipart" {
+			panic("simulated API crash after upstream completion")
+		}
+	}
+	crashed := false
+	func() {
+		defer func() { crashed = recover() != nil }()
+		itDo(router, http.MethodPost, "/"+bucket.Name+"/key?uploadId="+init.UploadId, complete)
+	}()
+	if !crashed || !completed {
+		t.Fatalf("API did not stop after upstream completion: crashed=%v upstream-completed=%v", crashed, completed)
+	}
+	generationCommitBoundary = priorHook
+	var tracking models.MultipartUpload
+	if err := database.DB.Where("upload_id = ?", init.UploadId).First(&tracking).Error; err != nil || tracking.Status != "in-progress" {
+		t.Fatalf("upstream-completed upload lost retry state: %+v %v", tracking, err)
+	}
+	if status, body := s3GetString(t, router, bucket.Name, "key"); status != http.StatusOK || body != "old" {
+		t.Fatalf("unpublished upstream generation became visible: %d %q", status, body)
+	}
 	if w := itDo(router, http.MethodPost, "/"+bucket.Name+"/key?uploadId="+init.UploadId, complete); w.Code != http.StatusOK {
-		t.Fatalf("complete: %d %s", w.Code, w.Body.String())
+		t.Fatalf("retry after consumed upstream upload: %d %s", w.Code, w.Body.String())
+	}
+	if completeCalls != 1 {
+		t.Errorf("retry reissued a consumed upstream completion: %d calls", completeCalls)
+	}
+	if err := database.DB.Where("upload_id = ?", init.UploadId).First(&tracking).Error; err != nil || tracking.Status != "completed" {
+		t.Fatalf("committed generation left upload active: %+v %v", tracking, err)
 	}
 	var current models.Object
 	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&current).Error; err != nil || current.GenerationID == "" || current.GenerationID == oldGenerationID {
@@ -332,6 +381,149 @@ func TestIntegrationMultipartCompletePublishesGenerationWithoutReplacingCurrent(
 	}
 	if w := itDo(router, http.MethodGet, "/"+bucket.Name+"/key?versionId="+previous.VersionID, nil); w.Code != http.StatusOK || w.Body.String() != "old" {
 		t.Errorf("multipart prior bytes: %d %q", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegrationMultipartRejectsMismatchedPartETag(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-multipart-etag"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, nil)
+	router := itS3Router(cfg, owner)
+	s3PutString(t, router, bucket.Name, "key", "old")
+	start := itDo(router, http.MethodPost, "/"+bucket.Name+"/key?uploads", nil)
+	if start.Code != http.StatusOK {
+		t.Fatalf("init: %d %s", start.Code, start.Body.String())
+	}
+	var upload InitiateMultipartUploadResult
+	if err := xml.Unmarshal(start.Body.Bytes(), &upload); err != nil {
+		t.Fatal(err)
+	}
+	part := itDo(router, http.MethodPut, "/"+bucket.Name+"/key?partNumber=1&uploadId="+upload.UploadId, []byte("new"))
+	if part.Code != http.StatusOK {
+		t.Fatalf("part: %d %s", part.Code, part.Body.String())
+	}
+	complete := []byte(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>wrong-etag</ETag></Part></CompleteMultipartUpload>`)
+	w := itDo(router, http.MethodPost, "/"+bucket.Name+"/key?uploadId="+upload.UploadId, complete)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "InvalidPart") {
+		t.Fatalf("mismatched part ETag accepted: %d %s", w.Code, w.Body.String())
+	}
+	if status, body := s3GetString(t, router, bucket.Name, "key"); status != http.StatusOK || body != "old" {
+		t.Errorf("mismatched part changed current: %d %q", status, body)
+	}
+}
+
+func TestIntegrationMultipartTrackingFailureRollsBackCurrentAndRetries(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-multipart-tracking"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) { b.Versioning = models.VersioningEnabled })
+	router := itS3Router(cfg, owner)
+	s3PutString(t, router, bucket.Name, "key", "old")
+	start := itDo(router, http.MethodPost, "/"+bucket.Name+"/key?uploads", nil)
+	if start.Code != http.StatusOK {
+		t.Fatalf("init: %d %s", start.Code, start.Body.String())
+	}
+	var upload InitiateMultipartUploadResult
+	if err := xml.Unmarshal(start.Body.Bytes(), &upload); err != nil {
+		t.Fatal(err)
+	}
+	part := itDo(router, http.MethodPut, "/"+bucket.Name+"/key?partNumber=1&uploadId="+upload.UploadId, []byte("new"))
+	if part.Code != http.StatusOK {
+		t.Fatalf("part: %d %s", part.Code, part.Body.String())
+	}
+	complete := []byte(fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, part.Header().Get("ETag")))
+	priorHook := generationCommitBoundary
+	defer func() { generationCommitBoundary = priorHook }()
+	generationCommitBoundary = func(boundary string) {
+		if boundary != "multipart" {
+			return
+		}
+		if err := database.DB.Model(&models.MultipartUpload{}).
+			Where("upload_id = ?", upload.UploadId).Update("status", "aborted").Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if w := itDo(router, http.MethodPost, "/"+bucket.Name+"/key?uploadId="+upload.UploadId, complete); w.Code != http.StatusInternalServerError {
+		t.Fatalf("tracking failure published object: %d %s", w.Code, w.Body.String())
+	}
+	generationCommitBoundary = priorHook
+	if status, body := s3GetString(t, router, bucket.Name, "key"); status != http.StatusOK || body != "old" {
+		t.Fatalf("failed tracking transaction changed current: %d %q", status, body)
+	}
+	var versions int64
+	if err := database.DB.Model(&models.ObjectVersion{}).Where("bucket_id = ? AND key = ?", bucket.ID, "key").Count(&versions).Error; err != nil || versions != 0 {
+		t.Fatalf("failed transaction archived current: count=%d err=%v", versions, err)
+	}
+	if err := database.DB.Model(&models.MultipartUpload{}).
+		Where("upload_id = ?", upload.UploadId).Update("status", "in-progress").Error; err != nil {
+		t.Fatal(err)
+	}
+	if w := itDo(router, http.MethodPost, "/"+bucket.Name+"/key?uploadId="+upload.UploadId, complete); w.Code != http.StatusOK {
+		t.Fatalf("retry failed tracking transaction: %d %s", w.Code, w.Body.String())
+	}
+	if status, body := s3GetString(t, router, bucket.Name, "key"); status != http.StatusOK || body != "new" {
+		t.Errorf("retried transaction bytes: %d %q", status, body)
+	}
+}
+
+func TestIntegrationMultipartPartReplacementWaitsForCompletion(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-multipart-race"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, nil)
+	router := itS3Router(cfg, owner)
+	start := itDo(router, http.MethodPost, "/"+bucket.Name+"/key?uploads", nil)
+	if start.Code != http.StatusOK {
+		t.Fatalf("init: %d %s", start.Code, start.Body.String())
+	}
+	var upload InitiateMultipartUploadResult
+	if err := xml.Unmarshal(start.Body.Bytes(), &upload); err != nil {
+		t.Fatal(err)
+	}
+	partPath := "/" + bucket.Name + "/key?partNumber=1&uploadId=" + upload.UploadId
+	part := itDo(router, http.MethodPut, partPath, []byte("first"))
+	if part.Code != http.StatusOK {
+		t.Fatalf("part: %d %s", part.Code, part.Body.String())
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	priorHook := generationCommitBoundary
+	generationCommitBoundary = func(boundary string) {
+		if boundary == "multipart" {
+			close(entered)
+			<-release
+		}
+	}
+	defer func() { generationCommitBoundary = priorHook }()
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	completeBody := []byte(fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, part.Header().Get("ETag")))
+	completed := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		completed <- itDo(router, http.MethodPost, "/"+bucket.Name+"/key?uploadId="+upload.UploadId, completeBody)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("multipart completion did not reach commit boundary")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPut, partPath, strings.NewReader("later")).WithContext(ctx)
+	blocked := httptest.NewRecorder()
+	router.ServeHTTP(blocked, req)
+	if blocked.Code == http.StatusOK {
+		t.Fatal("same-part replacement completed while multipart commit held its lock")
+	}
+	close(release)
+	if w := <-completed; w.Code != http.StatusOK {
+		t.Fatalf("complete after part lock wait: %d %s", w.Code, w.Body.String())
+	}
+	if status, body := s3GetString(t, router, bucket.Name, "key"); status != http.StatusOK || body != "first" {
+		t.Errorf("committed bytes changed by racing part replacement: %d %q", status, body)
 	}
 }
 

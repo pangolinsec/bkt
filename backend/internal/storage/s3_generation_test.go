@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -94,6 +96,30 @@ func TestS3GenerationConditionalPutAndRead(t *testing.T) {
 	}
 }
 
+func TestS3GenerationSpoolHasNoCrashLeftoverName(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows cannot unlink an open scratch file")
+	}
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	f, size, err := spoolS3Payload(strings.NewReader("bytes"), 5, "bkt-s3-generation-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if size != 5 {
+		t.Fatalf("spooled size = %d", size)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("named spool survives while payload is live: %+v %v", entries, err)
+	}
+	data, err := io.ReadAll(f)
+	if err != nil || string(data) != "bytes" {
+		t.Fatalf("seekable spool bytes: %q %v", data, err)
+	}
+}
+
 func TestS3MultipartGenerationUsesPrivatePhysicalKey(t *testing.T) {
 	id := uuid.NewString()
 	physical, err := s3GenerationKey("user/key", id)
@@ -101,6 +127,7 @@ func TestS3MultipartGenerationUsesPrivatePhysicalKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	var calls []string
+	completed := false
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/bucket/"+physical {
 			t.Errorf("multipart request used public key: %s", r.URL.Path)
@@ -115,6 +142,10 @@ func TestS3MultipartGenerationUsesPrivatePhysicalKey(t *testing.T) {
 		case r.Method == http.MethodPut && q.Get("partNumber") == "1":
 			w.Header().Set("ETag", `"part-etag"`)
 		case r.Method == http.MethodPost && q.Get("uploadId") == "upload-id":
+			if completed {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
 			if r.Header.Get("If-None-Match") != "*" {
 				t.Error("multipart completion lacked create-only condition")
 			}
@@ -126,9 +157,14 @@ func TestS3MultipartGenerationUsesPrivatePhysicalKey(t *testing.T) {
 			if err := xml.NewDecoder(r.Body).Decode(&complete); err != nil || len(complete.Parts) != 1 || complete.Parts[0].ETag != `"part-etag"` {
 				t.Errorf("completion did not preserve quoted upstream part ETag: %+v %v", complete, err)
 			}
+			completed = true
 			w.Header().Set("ETag", `"complete-etag"`)
 			_, _ = w.Write([]byte(`<CompleteMultipartUploadResult><ETag>"complete-etag"</ETag></CompleteMultipartUploadResult>`))
 		case r.Method == http.MethodHead:
+			if !completed {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
 			w.Header().Set("ETag", `"complete-etag"`)
 			w.Header().Set("Content-Length", "3")
 		case r.Method == http.MethodGet && q.Get("uploadId") == "upload-id":
@@ -165,10 +201,13 @@ func TestS3MultipartGenerationUsesPrivatePhysicalKey(t *testing.T) {
 	if err != nil || info == nil || info.Size != 3 || info.ETag != "complete-etag" {
 		t.Fatalf("complete: %+v %v", info, err)
 	}
+	if recovered, err := s.CompleteGenerationMultipartUpload("bucket", "user/key", id, uploadID, []CompletedPart{{PartNumber: 1, ETag: etag}}); err != nil || recovered == nil || recovered.ETag != info.ETag {
+		t.Fatalf("retry after consumed upstream MPU: %+v %v", recovered, err)
+	}
 	if err := s.AbortGenerationMultipartUpload("bucket", "user/key", id, uploadID); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 7 {
-		t.Errorf("expected initiate, part, two lists, complete, head, abort; got %v", calls)
+	if len(calls) != 9 {
+		t.Errorf("expected initiate, part, two lists, two completes, two heads, abort; got %v", calls)
 	}
 }

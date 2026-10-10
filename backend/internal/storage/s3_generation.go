@@ -62,9 +62,25 @@ func (s3s *S3Storage) PutGeneration(bucketName, objectKey, generationID string, 
 // spoolS3Payload drains a verified API stream before the AWS SDK signs it.
 // Its temporary file is private and caller-owned on success.
 func spoolS3Payload(data io.Reader, expected int64, pattern string) (*os.File, int64, error) {
-	tmp, err := os.CreateTemp("", pattern)
+	dir := os.Getenv("BKT_S3_GENERATION_SPOOL_DIR")
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	tmp, err := os.CreateTemp(dir, pattern)
 	if err != nil {
 		return nil, 0, err
+	}
+	// On Unix, keep the descriptor but unlink its name immediately so a
+	// killed process cannot strand a multi-gigabyte scratch payload.
+	if err := detachS3Spool(tmp); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return nil, 0, fmt.Errorf("unlink S3 generation scratch file: %w", err)
+	}
+	if err := reserveS3Spool(tmp, expected); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmp.Name())
+		return nil, 0, fmt.Errorf("reserve S3 generation scratch capacity: %w", err)
 	}
 	n, err := io.Copy(tmp, data)
 	if err == nil && expected >= 0 && n != expected {
@@ -199,14 +215,30 @@ func (s3s *S3Storage) CompleteGenerationMultipartUpload(bucketName, objectKey, g
 	}
 	ctx, cancel := s3LongCtx()
 	defer cancel()
-	if _, err := s3s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+	_, completeErr := s3s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket: aws.String(s3s.getBucketName(bucketName)), Key: aws.String(key), UploadId: aws.String(uploadID),
 		IfNoneMatch:     aws.String("*"),
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: awsParts},
-	}); err != nil {
-		return nil, fmt.Errorf("failed to complete generation multipart upload: %w", err)
+	})
+	// The upstream may have committed this hidden generation even if the
+	// Complete acknowledgement was lost. A retry sees NoSuchUpload, but HEAD
+	// of its persisted generation ID recovers the durable result.
+	info, headErr := s3s.GenerationInfo(bucketName, objectKey, generationID)
+	if headErr == nil {
+		return info, nil
 	}
-	// Read authoritative size and ETag before publishing the DB pointer.
+	if completeErr != nil {
+		return nil, fmt.Errorf("failed to complete generation multipart upload: %w", completeErr)
+	}
+	return nil, headErr
+}
+
+// GenerationInfo reads authoritative metadata for a completed hidden blob.
+func (s3s *S3Storage) GenerationInfo(bucketName, objectKey, generationID string) (*ObjectInfo, error) {
+	key, err := s3GenerationKey(objectKey, generationID)
+	if err != nil {
+		return nil, err
+	}
 	metaCtx, metaCancel := s3MetaCtx()
 	defer metaCancel()
 	head, err := s3s.client.HeadObject(metaCtx, &s3.HeadObjectInput{Bucket: aws.String(s3s.getBucketName(bucketName)), Key: aws.String(key)})

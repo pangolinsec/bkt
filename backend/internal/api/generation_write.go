@@ -23,6 +23,12 @@ var generationCommitBoundary = func(string) {}
 // Staged blobs are intentionally retained on a failed/ambiguous DB commit:
 // deleting one could remove bytes that a successful commit already names.
 func commitStagedGeneration(backend storage.GenerationStorage, bucket *models.Bucket, obj *models.Object) error {
+	return commitStagedGenerationWith(backend, bucket, obj, nil)
+}
+
+// commitStagedGenerationWith lets a caller commit operation bookkeeping in
+// the same transaction as the visible object and history pointers.
+func commitStagedGenerationWith(backend storage.GenerationStorage, bucket *models.Bucket, obj *models.Object, after func(*gorm.DB) error) error {
 	if obj.GenerationID == "" {
 		return fmt.Errorf("cannot commit an object without a generation")
 	}
@@ -48,6 +54,9 @@ func commitStagedGeneration(backend storage.GenerationStorage, bucket *models.Bu
 		}
 		if err := upsertCurrentObjectInTx(tx, obj); err != nil {
 			return fmt.Errorf("commit current generation row: %w", err)
+		}
+		if after != nil {
+			return after(tx)
 		}
 		return nil
 	})
