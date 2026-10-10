@@ -517,11 +517,19 @@ func expireCurrentObject(backend storage.StorageBackend, b *models.Bucket, key s
 	if retentionBlocks(b, obj.UpdatedAt) {
 		return false, false // defensive: retention requires versioning, so not normally reachable
 	}
-	if derr := backend.DeleteObject(b.Name, key); derr != nil {
+	// For generation-capable storage, the row is the visibility pointer. Keep
+	// its bytes available to readers that pinned the row before this delete.
+	if _, generationAware := backend.(storage.GenerationStorage); generationAware {
+		generationCommitBoundary("lifecycle-expire")
+	} else if derr := backend.DeleteObject(b.Name, key); derr != nil {
 		logger.Warn("Lifecycle: expiry failed", map[string]interface{}{"bucket": b.Name, "key": key, "error": derr.Error()})
 		return false, false
 	}
-	database.DB.Delete(&models.Object{}, "id = ?", obj.ID)
+	result := database.DB.Delete(&models.Object{}, "id = ?", obj.ID)
+	if result.Error != nil || result.RowsAffected != 1 {
+		logger.Warn("Lifecycle: metadata expiry failed", map[string]interface{}{"bucket": b.Name, "key": key, "error": result.Error, "rows": result.RowsAffected})
+		return false, false
+	}
 	return true, false
 }
 

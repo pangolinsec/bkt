@@ -479,10 +479,19 @@ func mirrorDeleteLocked(dstBackend storage.StorageBackend, src, dst *models.Buck
 	if retentionBlocks(dst, d.UpdatedAt) {
 		return false
 	}
-	if err := dstBackend.DeleteObject(dst.Name, key); err != nil {
+	// Commit visibility through metadata before reclaiming bytes. Both a
+	// generated object and a pre-migration public-key blob can be pinned by
+	// an in-flight reader when this sweep runs.
+	if _, generationAware := dstBackend.(storage.GenerationStorage); generationAware {
+		generationCommitBoundary("replication-delete")
+	} else if err := dstBackend.DeleteObject(dst.Name, key); err != nil {
 		logger.Warn("Replication: mirror-delete failed", map[string]interface{}{"bucket": dst.Name, "key": key, "error": err.Error()})
 		return false
 	}
-	database.DB.Delete(&models.Object{}, "id = ?", d.ID)
+	result := database.DB.Delete(&models.Object{}, "id = ?", d.ID)
+	if result.Error != nil || result.RowsAffected != 1 {
+		logger.Warn("Replication: mirror-delete metadata failed", map[string]interface{}{"bucket": dst.Name, "key": key, "error": result.Error, "rows": result.RowsAffected})
+		return false
+	}
 	return true
 }

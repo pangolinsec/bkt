@@ -18,6 +18,8 @@ import (
 	"bkt/internal/database"
 	"bkt/internal/models"
 	"bkt/internal/storage"
+
+	"github.com/google/uuid"
 )
 
 // These subprocesses enter real API handlers and exit at their storage/DB
@@ -85,6 +87,10 @@ func generationCrashChild(t *testing.T) bool {
 		itDo(console, http.MethodPost, "/api/buckets/"+bucketName+"/objects/move", []byte(`{"source_key":"source","destination_key":"dest"}`))
 	case "folder-delete":
 		itDo(itConsoleRouter(cfg, owner), http.MethodDelete, folderURL(bucketName, "folder/"), nil)
+	case "lifecycle-expire":
+		expireCurrentObject(storage.NewLocalStorage(cfg.Storage.RootPath), &bucket, "dest", time.Now().Add(time.Minute))
+	case "replication-delete":
+		mirrorDelete(storage.NewLocalStorage(cfg.Storage.RootPath), &models.Bucket{ID: uuid.New()}, &bucket, "dest")
 	default:
 		t.Fatalf("unknown crash mode %q", mode)
 	}
@@ -271,6 +277,81 @@ func TestIntegrationGenerationCrashFolderDelete(t *testing.T) {
 	if after.Code != http.StatusOK || after.Body.String() != "old-bytes" || after.Header().Get("ETag") != before.Header().Get("ETag") {
 		t.Errorf("folder delete crash lost committed bytes: status=%d body=%q ETag=%q committed ETag=%q",
 			after.Code, after.Body.String(), after.Header().Get("ETag"), before.Header().Get("ETag"))
+	}
+}
+
+func TestIntegrationGenerationCrashLifecycleExpiry(t *testing.T) {
+	if generationCrashChild(t) {
+		return
+	}
+	testGenerationCrashBackgroundDelete(t, "lifecycle-expire")
+}
+
+func TestIntegrationGenerationCrashReplicationDelete(t *testing.T) {
+	if generationCrashChild(t) {
+		return
+	}
+	testGenerationCrashBackgroundDelete(t, "replication-delete")
+}
+
+func testGenerationCrashBackgroundDelete(t *testing.T, mode string) {
+	t.Helper()
+	cfg, _, bucket, s3 := generationFixture(t)
+	backend := storage.NewLocalStorage(cfg.Storage.RootPath)
+	if err := backend.PutObject(bucket.Name, "dest", bytes.NewReader([]byte("old-bytes")), 9, "text/plain", nil); err != nil {
+		t.Fatal(err)
+	}
+	info, err := backend.GetObjectInfo(bucket.Name, "dest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.Create(&models.Object{
+		BucketID: bucket.ID, Key: "dest", Size: 9, ContentType: "text/plain", ETag: info.ETag, StoragePath: "dest",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	before := itDo(s3, http.MethodHead, "/"+bucket.Name+"/dest", nil)
+	runGenerationCrash(t, cfg, bucket.Name, mode, "")
+	after := itDo(s3, http.MethodGet, "/"+bucket.Name+"/dest", nil)
+	if after.Code != http.StatusOK || after.Body.String() != "old-bytes" || after.Header().Get("ETag") != before.Header().Get("ETag") {
+		t.Errorf("%s crash lost committed bytes: status=%d body=%q ETag=%q committed ETag=%q",
+			mode, after.Code, after.Body.String(), after.Header().Get("ETag"), before.Header().Get("ETag"))
+	}
+}
+
+func TestIntegrationBackgroundDeletesRetainGenerationForReaders(t *testing.T) {
+	for _, mode := range []string{"lifecycle-expire", "replication-delete"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg, _, bucket, s3 := generationFixture(t)
+			s3PutString(t, s3, bucket.Name, "dest", "old-bytes")
+			var current models.Object
+			if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "dest").First(&current).Error; err != nil {
+				t.Fatal(err)
+			}
+			backend := storage.NewLocalStorage(cfg.Storage.RootPath)
+			var removed, busy bool
+			switch mode {
+			case "lifecycle-expire":
+				removed, busy = expireCurrentObject(backend, &bucket, "dest", time.Now().Add(time.Minute))
+			case "replication-delete":
+				removed, busy = mirrorDelete(backend, &models.Bucket{ID: uuid.New()}, &bucket, "dest")
+			}
+			if !removed || busy {
+				t.Fatalf("%s did not remove current: removed=%v busy=%v", mode, removed, busy)
+			}
+			if w := itDo(s3, http.MethodGet, "/"+bucket.Name+"/dest", nil); w.Code != http.StatusNotFound {
+				t.Errorf("%s left current visible: %d %s", mode, w.Code, w.Body.String())
+			}
+			rc, err := backend.GetGeneration(bucket.Name, "dest", current.GenerationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rc.Close()
+			content, err := io.ReadAll(rc)
+			if err != nil || string(content) != "old-bytes" {
+				t.Errorf("%s reclaimed a live reader's generation: %q %v", mode, content, err)
+			}
+		})
 	}
 }
 
