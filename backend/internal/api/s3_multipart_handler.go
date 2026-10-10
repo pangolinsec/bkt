@@ -706,7 +706,7 @@ func (h *S3APIHandler) UploadPartCopy(c *gin.Context) {
 
 	// Native ranged read of the source (no streaming-and-discarding up to the
 	// range start on the S3 backend).
-	partReader, err := storage.GetObjectRange(srcStorage, srcBucket, srcKey, offset, length)
+	partReader, err := getCurrentRange(srcStorage, srcBucket, &srcObj, offset, length)
 	if err != nil {
 		h.s3Error(c, "InternalError", "Failed to read source object", srcKey, http.StatusInternalServerError)
 		return
