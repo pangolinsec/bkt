@@ -351,36 +351,59 @@ func TestIntegrationListObjectsReconcilePruneSafety(t *testing.T) {
 }
 
 func TestIntegrationDeletedLegacyS3ObjectStaysDeletedAfterConsoleList(t *testing.T) {
-	cfg := itConfig(t)
-	fake := &fakeS3Listing{keys: []string{"legacy"}}
-	srv := httptest.NewServer(fake)
-	defer srv.Close()
-	cfg.Storage.S3.Endpoint = strings.TrimPrefix(srv.URL, "http://")
-	cfg.Storage.S3.Region = "us-east-1"
-	cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.SecretAccessKey = "AK", "SK"
-	cfg.Storage.S3.ForcePathStyle = true
+	for _, route := range []string{"console", "s3-single", "s3-batch"} {
+		t.Run(route, func(t *testing.T) {
+			cfg := itConfig(t)
+			fake := &fakeS3Listing{keys: []string{"legacy"}}
+			srv := httptest.NewServer(fake)
+			defer srv.Close()
+			cfg.Storage.S3.Endpoint = strings.TrimPrefix(srv.URL, "http://")
+			cfg.Storage.S3.Region = "us-east-1"
+			cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.SecretAccessKey = "AK", "SK"
+			cfg.Storage.S3.ForcePathStyle = true
 
-	admin := mkUser(t, itName("legacy-delete"), "password-123", true, false)
-	bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
-	seedRows(t, bucket.ID, time.Now().Add(-time.Hour), "legacy")
-	handler := NewBucketHandler(cfg)
-	router := itRouter(admin)
-	router.DELETE("/buckets/:name/objects/*key", handler.DeleteObject)
-	router.GET("/buckets/:name/objects", handler.ListObjects)
+			admin := mkUser(t, itName("legacy-delete"), "password-123", true, false)
+			bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+			seedRows(t, bucket.ID, time.Now().Add(-time.Hour), "legacy")
+			consoleHandler := NewBucketHandler(cfg)
+			console := itRouter(admin)
+			console.DELETE("/buckets/:name/objects/*key", consoleHandler.DeleteObject)
+			console.GET("/buckets/:name/objects", consoleHandler.ListObjects)
+			s3 := itS3Router(cfg, admin)
+			s3.DELETE("/:bucket/*key", NewS3APIHandler(cfg).DeleteObject)
 
-	deleted := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name+"/objects/legacy", nil)
-	if deleted.Code != http.StatusOK {
-		t.Fatalf("delete legacy object: %d %s", deleted.Code, deleted.Body.String())
-	}
-	if got := rowKeys(t, bucket.ID); len(got) != 0 {
-		t.Fatalf("deleted object retained current metadata: %v", got)
-	}
-	listed := listObjectsKeys(t, router, bucket.Name)
-	// Reconciliation imports asynchronously; check both the response and the
-	// persistent index after it has had time to run.
-	time.Sleep(200 * time.Millisecond)
-	if len(listed) != 0 || len(rowKeys(t, bucket.ID)) != 0 {
-		t.Errorf("deleted legacy object was resurrected by console listing: listed=%v rows=%v", listed, rowKeys(t, bucket.ID))
+			switch route {
+			case "console":
+				deleted := itDo(console, http.MethodDelete, "/buckets/"+bucket.Name+"/objects/legacy", nil)
+				if deleted.Code != http.StatusOK {
+					t.Fatalf("console delete legacy object: %d %s", deleted.Code, deleted.Body.String())
+				}
+			case "s3-single":
+				deleted := itDo(s3, http.MethodDelete, "/"+bucket.Name+"/legacy", nil)
+				if deleted.Code != http.StatusNoContent {
+					t.Fatalf("S3 DeleteObject legacy object: %d %s", deleted.Code, deleted.Body.String())
+				}
+			case "s3-batch":
+				deleted := deleteObjects(t, s3, bucket.Name, DeleteObject{Key: "legacy"})
+				if len(deleted.Errors) != 0 || len(deleted.Deleted) != 1 || deleted.Deleted[0].Key != "legacy" {
+					t.Fatalf("S3 DeleteObjects legacy object: %+v", deleted)
+				}
+			}
+			if got := rowKeys(t, bucket.ID); len(got) != 0 {
+				t.Fatalf("deleted object retained current metadata: %v", got)
+			}
+			listed := listObjectsKeys(t, console, bucket.Name)
+			// A listed key is imported asynchronously. Wait for that import to
+			// persist before asserting, without a timing-dependent fixed sleep.
+			if len(listed) != 0 {
+				waitFor(t, "deleted legacy key imported by reconciliation", func() bool {
+					return len(rowKeys(t, bucket.ID)) != 0
+				})
+			}
+			if rows := rowKeys(t, bucket.ID); len(listed) != 0 || len(rows) != 0 {
+				t.Errorf("deleted legacy object was resurrected by console listing: listed=%v rows=%v", listed, rows)
+			}
+		})
 	}
 }
 
