@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"sort"
 	"sync"
 	"time"
 
@@ -310,6 +311,24 @@ func lockKeysAcrossBuckets(bucketA, keyA, bucketB, keyB string) func() {
 	}
 }
 
+func acrossBucketLockIDs(bucketA, keyA, bucketB, keyB string) []string {
+	a, b := bucketA+"\x00"+keyA, bucketB+"\x00"+keyB
+	if a == b {
+		return []string{a}
+	}
+	ids := []string{a, b}
+	sort.Strings(ids)
+	return ids
+}
+
+func lockKeysAcrossBucketsChecked(bucketA, keyA, bucketB, keyB string) (func(), error) {
+	return lockObjectIDsChecked(acrossBucketLockIDs(bucketA, keyA, bucketB, keyB))
+}
+
+func tryLockKeysAcrossBucketsChecked(bucketA, keyA, bucketB, keyB string, timeout time.Duration) (func(), bool) {
+	return tryLockObjectIDsChecked(acrossBucketLockIDs(bucketA, keyA, bucketB, keyB), timeout)
+}
+
 // tryLockKeysAcrossBuckets is lockKeysAcrossBuckets with a deadline covering
 // both acquisitions (same global order). On timeout it holds nothing and
 // returns ok=false; on success the unlock func releases both.
@@ -347,7 +366,7 @@ func tryLockKeysAcrossBuckets(bucketA, keyA, bucketB, keyB string, timeout time.
 // Reports whether a copy was committed, and whether the keys were busy (lock
 // not acquired within sweepLockTimeout; retried next sweep).
 func replicateObject(srcBackend, dstBackend storage.StorageBackend, src, dst *models.Bucket, key string) (copied, busy bool) {
-	unlock, ok := tryLockKeysAcrossBuckets(src.Name, key, dst.Name, key, sweepLockTimeout)
+	unlock, ok := tryLockKeysAcrossBucketsChecked(src.Name, key, dst.Name, key, sweepLockTimeout)
 	if !ok {
 		return false, true
 	}
@@ -415,7 +434,7 @@ func replicateObjectLocked(srcBackend, dstBackend storage.StorageBackend, src, d
 // history — including retained data — is kept. Reports whether it removed,
 // and whether the key was busy (retried next sweep).
 func mirrorDelete(dstBackend storage.StorageBackend, src, dst *models.Bucket, key string) (removed, busy bool) {
-	unlock, ok := tryLockObjectKeys(dst.Name, sweepLockTimeout, key)
+	unlock, ok := tryLockObjectKeysChecked(dst.Name, sweepLockTimeout, key)
 	if !ok {
 		return false, true
 	}

@@ -1351,7 +1351,7 @@ func planReconcilePrune(rows []models.Object, listed map[string]storage.ObjectIn
 // so a concurrent overwrite, delete or move of the key always wins.
 func pruneStaleObjectRows(bucketName string, stale []models.Object) {
 	for _, obj := range stale {
-		unlock, ok := tryLockObjectKeys(bucketName, reconcilePruneLockWait, obj.Key)
+		unlock, ok := tryLockObjectKeysChecked(bucketName, reconcilePruneLockWait, obj.Key)
 		if !ok {
 			continue
 		}
@@ -1639,7 +1639,10 @@ func (h *BucketHandler) limitMultipartBody(c *gin.Context) bool {
 // upsert — rolling everything back if any step fails. It returns the stored
 // row, or an HTTP status and error.
 func (h *BucketHandler) storeObject(backend storage.StorageBackend, bucket *models.Bucket, key string, data io.Reader, size int64, contentType, sha256Hex string) (*models.Object, int, error) {
-	unlock := lockObjectKeys(bucket.Name, key)
+	unlock, lockErr := lockObjectKeysChecked(bucket.Name, key)
+	if lockErr != nil {
+		return nil, http.StatusInternalServerError, lockErr
+	}
 	defer unlock()
 
 	reservation, qerr := reserveBucketQuota(bucket, size)
@@ -1886,7 +1889,11 @@ func (h *BucketHandler) DeleteObject(c *gin.Context) {
 
 	// Serialize with other writers of this key (archive/delete must not
 	// interleave with an overwrite).
-	unlock := lockObjectKeys(bucketName, objectKey)
+	unlock, lockErr := lockObjectKeysChecked(bucketName, objectKey)
+	if lockErr != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to lock object"})
+		return
+	}
 	defer unlock()
 
 	// Get object metadata from database
@@ -2127,7 +2134,11 @@ func (h *BucketHandler) moveSingleObject(c *gin.Context, srcKey, dstKey, success
 		return
 	}
 
-	unlock := lockObjectKeys(bucketName, srcKey, dstKey)
+	unlock, lockErr := lockObjectKeysChecked(bucketName, srcKey, dstKey)
+	if lockErr != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to lock objects"})
+		return
+	}
 	defer unlock()
 
 	// Get source object from database
@@ -2417,7 +2428,7 @@ func (h *BucketHandler) MoveFolder(c *gin.Context) {
 	// them, so rather than queueing behind a slow upload of one key (while
 	// blocking every other writer of the keys already acquired) it gives up
 	// and asks the client to retry.
-	unlock, locked := tryLockObjectKeys(bucketName, folderMoveLockTimeout, lockKeys...)
+	unlock, locked := tryLockObjectKeysChecked(bucketName, folderMoveLockTimeout, lockKeys...)
 	if !locked {
 		c.JSON(http.StatusConflict, models.ErrorResponse{
 			Error:   "Objects busy",

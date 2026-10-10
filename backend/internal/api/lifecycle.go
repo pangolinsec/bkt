@@ -494,7 +494,7 @@ func RunLifecycleSweep(cfg *config.Config) {
 // try-acquired (sweepLockTimeout); a busy key reports busy=true and is left
 // for the next sweep rather than stalling the whole sweep.
 func expireCurrentObject(backend storage.StorageBackend, b *models.Bucket, key string, cutoff time.Time) (expired, busy bool) {
-	unlock, ok := tryLockObjectKeys(b.Name, sweepLockTimeout, key)
+	unlock, ok := tryLockObjectKeysChecked(b.Name, sweepLockTimeout, key)
 	if !ok {
 		return false, true
 	}
@@ -530,7 +530,7 @@ func expireCurrentObject(backend storage.StorageBackend, b *models.Bucket, key s
 // under the lock). Reports whether the version was removed, and whether the
 // key was busy (lock not acquired within sweepLockTimeout; retried later).
 func expireNoncurrentVersion(backend storage.StorageBackend, b *models.Bucket, v *models.ObjectVersion) (removed, busy bool) {
-	unlock, ok := tryLockObjectKeys(b.Name, sweepLockTimeout, v.Key)
+	unlock, ok := tryLockObjectKeysChecked(b.Name, sweepLockTimeout, v.Key)
 	if !ok {
 		return false, true
 	}

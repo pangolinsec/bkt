@@ -658,7 +658,7 @@ func (h *S3APIHandler) checkCopySourcePreconditions(c *gin.Context, source *mode
 	modifiedAt := source.UpdatedAt.UTC().Truncate(time.Second)
 	for _, item := range []struct {
 		header string
-		match bool
+		match  bool
 	}{
 		{"x-amz-copy-source-if-unmodified-since", false},
 		{"x-amz-copy-source-if-modified-since", true},
@@ -809,7 +809,11 @@ func (h *S3APIHandler) PutObject(c *gin.Context) {
 
 	// Serialize with other writers of this key: archive → write → metadata
 	// must not interleave with a concurrent overwrite or delete.
-	unlock := lockObjectKeys(bucketName, objectKey)
+	unlock, lockErr := lockObjectKeysChecked(bucketName, objectKey)
+	if lockErr != nil {
+		h.s3Error(c, "InternalError", "Failed to lock object", objectKey, http.StatusInternalServerError)
+		return
+	}
 	defer unlock()
 	hadPrior, ok := h.checkWritePreconditions(c, &bucket, objectKey)
 	if !ok {
@@ -943,7 +947,11 @@ func (h *S3APIHandler) DeleteObject(c *gin.Context) {
 	}
 
 	// Serialize with other writers of this key.
-	unlock := lockObjectKeys(bucketName, objectKey)
+	unlock, lockErr := lockObjectKeysChecked(bucketName, objectKey)
+	if lockErr != nil {
+		h.s3Error(c, "InternalError", "Failed to lock object", objectKey, http.StatusInternalServerError)
+		return
+	}
 	defer unlock()
 
 	// Version-addressed delete: permanently removes that one version.
@@ -1237,10 +1245,15 @@ func (h *S3APIHandler) CopyObject(c *gin.Context, copySource string) {
 	// the source must not swap its bytes out mid-copy). Both helpers use the
 	// same global lock order, so this cannot deadlock.
 	var unlock func()
+	var lockErr error
 	if srcBucket == destBucket {
-		unlock = lockObjectKeys(destBucket, srcKey, destKey)
+		unlock, lockErr = lockObjectKeysChecked(destBucket, srcKey, destKey)
 	} else {
-		unlock = lockKeysAcrossBuckets(srcBucket, srcKey, destBucket, destKey)
+		unlock, lockErr = lockKeysAcrossBucketsChecked(srcBucket, srcKey, destBucket, destKey)
+	}
+	if lockErr != nil {
+		h.s3Error(c, "InternalError", "Failed to lock copy keys", destKey, http.StatusInternalServerError)
+		return
 	}
 	defer unlock()
 	if _, ok := h.checkWritePreconditions(c, &destBucketModel, destKey); !ok {
@@ -1473,7 +1486,10 @@ func (h *S3APIHandler) deleteOneForBatch(storageBackend storage.StorageBackend, 
 	if validation.IsReservedObjectKey(key) {
 		return DeletedObject{Key: key}, nil
 	}
-	unlock := lockObjectKeys(bucket.Name, key)
+	unlock, lockErr := lockObjectKeysChecked(bucket.Name, key)
+	if lockErr != nil {
+		return DeletedObject{}, &DeleteError{Key: key, Code: "InternalError", Message: "Failed to lock object"}
+	}
 	defer unlock()
 
 	var dbObj models.Object
@@ -1526,7 +1542,10 @@ func (h *S3APIHandler) deleteVersionForBatch(backend storage.StorageBackend, buc
 	if validation.IsReservedObjectKey(key) {
 		return DeletedObject{Key: key, VersionId: versionID}, nil
 	}
-	unlock := lockObjectKeys(bucket.Name, key)
+	unlock, lockErr := lockObjectKeysChecked(bucket.Name, key)
+	if lockErr != nil {
+		return DeletedObject{}, &DeleteError{Key: key, VersionId: versionID, Code: "InternalError", Message: "Failed to lock object"}
+	}
 	defer unlock()
 	wasMarker, err := deleteVersionLocked(backend, bucket, key, versionID)
 	if err != nil {

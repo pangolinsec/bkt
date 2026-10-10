@@ -1,6 +1,7 @@
 package database
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,12 +12,19 @@ import (
 	"bkt/internal/logger"
 	"bkt/internal/models"
 
+	_ "github.com/jackc/pgx/v5/stdlib" // PostgreSQL sessions for object advisory locks
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 )
 
 var DB *gorm.DB
+
+// AdvisoryDB has its own connection pool because object writers hold a
+// session advisory lock while streaming bytes. Sharing DB's pool would let
+// concurrent uploads occupy every connection and deadlock their metadata
+// queries, which also need a connection before the locks can be released.
+var AdvisoryDB *sql.DB
 
 // migrationAdvisoryLockKey is an arbitrary but fixed key so that, in a
 // multi-replica deployment, only one process runs AutoMigrate at a time.
@@ -39,8 +47,24 @@ func gormLogLevel() gormlogger.LogLevel {
 // Initialize connects to the database and runs migrations
 func Initialize(cfg *config.Config) error {
 	dsn := cfg.GetDSN()
+	lockDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		return fmt.Errorf("failed to open advisory lock database: %w", err)
+	}
+	lockDB.SetMaxOpenConns(25)
+	lockDB.SetMaxIdleConns(10)
+	lockDB.SetConnMaxLifetime(time.Hour)
+	if err := lockDB.Ping(); err != nil {
+		_ = lockDB.Close()
+		return fmt.Errorf("failed to connect advisory lock database: %w", err)
+	}
+	lockDBInstalled := false
+	defer func() {
+		if !lockDBInstalled {
+			_ = lockDB.Close()
+		}
+	}()
 
-	var err error
 	DB, err = gorm.Open(postgres.Open(dsn), &gorm.Config{
 		Logger: gormlogger.Default.LogMode(gormLogLevel()),
 	})
@@ -102,6 +126,11 @@ func Initialize(cfg *config.Config) error {
 	}); err != nil {
 		return err
 	}
+	if AdvisoryDB != nil {
+		_ = AdvisoryDB.Close()
+	}
+	AdvisoryDB = lockDB
+	lockDBInstalled = true
 
 	return nil
 }

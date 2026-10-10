@@ -1,6 +1,11 @@
 package api
 
 import (
+	"context"
+	"crypto/sha256"
+	"database/sql"
+	"database/sql/driver"
+	"encoding/binary"
 	"fmt"
 	"sort"
 	"sync"
@@ -21,14 +26,10 @@ import (
 // Every mutation of an object's current state (write, overwrite, delete, move)
 // is a multi-step sequence — archive the current version, write the bytes,
 // update the metadata row — that must not interleave with another mutation of
-// the same key: two racing overwrites of a versioned key would otherwise both
-// archive the same "current" version id (destroying one version's bytes), and
-// racing unversioned writes could leave a metadata row describing different
-// bytes than the ones on disk. lockObjectKeys serializes those sequences per
-// (bucket, key) within this process. Handlers in other files that mutate
-// objects (restore, version delete, lifecycle, replication) should take the
-// same lock. Storage-level archive also refuses to overwrite an existing
-// archived version, which covers multi-process deployments.
+// the same key. Production mutators use lockObjectKeysChecked (or its bounded
+// try variant), which combines this process's key semaphore with a PostgreSQL
+// session advisory lock shared by all replicas. The local-only helpers below
+// exist for unit tests of key ordering and must not guard production writes.
 
 // Each key's lock is a 1-slot channel semaphore (rather than a sync.Mutex) so
 // acquisition can be abandoned: tryLockObjectKeys gives up after a timeout,
@@ -92,9 +93,9 @@ func unlockKeyEntries(ids []string, entries []*keyLockEntry) {
 	}
 }
 
-// lockObjectKeys locks the given keys of one bucket and returns the unlock
-// function. Keys are de-duplicated and locked in sorted order so concurrent
-// multi-key lockers (moves) cannot deadlock. The returned func is idempotent.
+// lockObjectKeys is the local-only key-ordering primitive for unit tests.
+// Production writers must use lockObjectKeysChecked so they serialize across
+// replicas. Keys are de-duplicated and ordered; unlock is idempotent.
 func lockObjectKeys(bucketName string, keys ...string) func() {
 	ids := objectLockIDs(bucketName, keys)
 	entries := make([]*keyLockEntry, len(ids))
@@ -105,6 +106,160 @@ func lockObjectKeys(bucketName string, keys ...string) func() {
 	}
 	var once sync.Once
 	return func() { once.Do(func() { unlockKeyEntries(ids, entries) }) }
+}
+
+// advisoryKey is namespaced separately from the migration advisory lock.
+// Hashing the complete bucket/key pair keeps arbitrary S3 keys out of SQL and
+// gives every replica the same lock order and identity.
+func advisoryKey(id string) int64 {
+	sum := sha256.Sum256([]byte("bkt/object-write/v1\x00" + id))
+	return int64(binary.BigEndian.Uint64(sum[:8]))
+}
+
+// lockObjectIDsChecked combines the local lock with PostgreSQL session locks.
+// A session lock remains held across the filesystem write and DB commit; a
+// transaction-scoped lock would end before the streamed body was committed.
+// Failure to acquire the shared lock is returned to callers, never treated
+// as permission to mutate an unlocked object.
+func lockObjectIDsChecked(ids []string) (func(), error) {
+	entries := make([]*keyLockEntry, len(ids))
+	for i, id := range ids {
+		e := acquireKeyLockEntry(id)
+		e.sem <- struct{}{}
+		entries[i] = e
+	}
+	localUnlock := func() { unlockKeyEntries(ids, entries) }
+	if database.AdvisoryDB == nil {
+		localUnlock()
+		return nil, fmt.Errorf("object write lock: advisory database not initialized")
+	}
+	conn, err := database.AdvisoryDB.Conn(context.Background())
+	if err != nil {
+		localUnlock()
+		return nil, fmt.Errorf("object write lock: database connection: %w", err)
+	}
+	locked := 0
+	for _, id := range ids {
+		if _, err = conn.ExecContext(context.Background(), "SELECT pg_advisory_lock($1)", advisoryKey(id)); err != nil {
+			break
+		}
+		locked++
+	}
+	if err != nil {
+		unlockAdvisory(conn, ids[:locked])
+		_ = conn.Close()
+		localUnlock()
+		return nil, fmt.Errorf("object write lock: acquire: %w", err)
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			unlockAdvisory(conn, ids)
+			_ = conn.Close()
+			localUnlock()
+		})
+	}, nil
+}
+
+func unlockAdvisory(conn *sql.Conn, ids []string) {
+	failed := false
+	for i := len(ids) - 1; i >= 0; i-- {
+		var released bool
+		if err := conn.QueryRowContext(context.Background(), "SELECT pg_advisory_unlock($1)", advisoryKey(ids[i])).Scan(&released); err != nil || !released {
+			failed = true
+			logger.Warn("Failed to release object write advisory lock", map[string]interface{}{"error": fmt.Sprintf("err=%v released=%v", err, released)})
+		}
+	}
+	if failed {
+		// A session with an unreleased advisory lock must never be returned to
+		// the pool, where its next user would inherit that lock.
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	}
+}
+
+func lockObjectKeysChecked(bucketName string, keys ...string) (func(), error) {
+	return lockObjectIDsChecked(objectLockIDs(bucketName, keys))
+}
+
+// tryLockObjectIDsChecked uses the same global ordering but never lets a
+// background sweep block indefinitely behind an upload in another replica.
+func tryLockObjectIDsChecked(ids []string, timeout time.Duration) (func(), bool) {
+	deadline := time.Now().Add(timeout)
+	entries := make([]*keyLockEntry, 0, len(ids))
+	for _, id := range ids {
+		e := acquireKeyLockEntry(id)
+		select {
+		case e.sem <- struct{}{}:
+			entries = append(entries, e)
+		default:
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				releaseKeyLockEntry(id, e)
+				unlockKeyEntries(ids[:len(entries)], entries)
+				return func() {}, false
+			}
+			timer := time.NewTimer(remaining)
+			select {
+			case e.sem <- struct{}{}:
+				entries = append(entries, e)
+			case <-timer.C:
+				releaseKeyLockEntry(id, e)
+				timer.Stop()
+				unlockKeyEntries(ids[:len(entries)], entries)
+				return func() {}, false
+			}
+			timer.Stop()
+		}
+	}
+	localUnlock := func() { unlockKeyEntries(ids, entries) }
+	if database.AdvisoryDB == nil {
+		localUnlock()
+		return func() {}, false
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	conn, err := database.AdvisoryDB.Conn(ctx)
+	if err != nil {
+		localUnlock()
+		return func() {}, false
+	}
+	locked := 0
+	for _, id := range ids {
+		acquired := false
+		for {
+			err = conn.QueryRowContext(ctx, "SELECT pg_try_advisory_lock($1)", advisoryKey(id)).Scan(&acquired)
+			if err != nil || acquired {
+				break
+			}
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				break
+			}
+			if remaining > 10*time.Millisecond {
+				remaining = 10 * time.Millisecond
+			}
+			time.Sleep(remaining)
+		}
+		if err != nil || !acquired {
+			unlockAdvisory(conn, ids[:locked])
+			_ = conn.Close()
+			localUnlock()
+			return func() {}, false
+		}
+		locked++
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			unlockAdvisory(conn, ids)
+			_ = conn.Close()
+			localUnlock()
+		})
+	}, true
+}
+
+func tryLockObjectKeysChecked(bucketName string, timeout time.Duration, keys ...string) (func(), bool) {
+	return tryLockObjectIDsChecked(objectLockIDs(bucketName, keys), timeout)
 }
 
 // tryLockObjectKeys is lockObjectKeys with a deadline: it acquires all keys in
