@@ -1,6 +1,7 @@
 package api
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -19,10 +20,37 @@ import (
 // working); `object_versions` holds archived prior versions and delete
 // markers. Version bytes live in the backend's hidden version storage.
 
+// nextVersionedAt keeps the history order stable at PostgreSQL's microsecond
+// precision. A content archive and its following delete marker can otherwise
+// receive the same stored timestamp; the UUID tie-breaker then randomly
+// decides whether a deleted key is visible. Callers hold the key write lock,
+// so the maximum committed timestamp cannot advance concurrently.
+func nextVersionedAt(bucketID uuid.UUID, key string, after time.Time) (time.Time, error) {
+	var latest sql.NullTime
+	if err := database.DB.Raw("SELECT MAX(versioned_at) FROM object_versions WHERE bucket_id = ? AND key = ?", bucketID, key).Row().Scan(&latest); err != nil {
+		return time.Time{}, fmt.Errorf("load newest version timestamp: %w", err)
+	}
+	next := time.Now().UTC().Truncate(time.Microsecond)
+	if latest.Valid && !next.After(latest.Time) {
+		next = latest.Time.UTC().Add(time.Microsecond)
+	}
+	if !after.IsZero() {
+		bound := after.UTC().Truncate(time.Microsecond)
+		if !next.After(bound) {
+			next = bound.Add(time.Microsecond)
+		}
+	}
+	return next, nil
+}
+
 // archiveCurrentVersion moves the current object's bytes into version storage
 // and records it as an ObjectVersion. The objects row itself is left for the
 // caller to overwrite or delete. Returns the archived version's id.
 func archiveCurrentVersion(backend storage.StorageBackend, bucket *models.Bucket, obj *models.Object) (string, error) {
+	versionedAt, err := nextVersionedAt(bucket.ID, obj.Key, time.Time{})
+	if err != nil {
+		return "", err
+	}
 	versionID := obj.VersionID
 	if versionID == "" {
 		// Pre-versioning ("null") current object: assign an id at archive time
@@ -43,7 +71,7 @@ func archiveCurrentVersion(backend storage.StorageBackend, bucket *models.Bucket
 		ETag:               obj.ETag,
 		Metadata:           obj.Metadata,
 		Tags:               obj.Tags,
-		VersionedAt:        time.Now(),
+		VersionedAt:        versionedAt,
 		ContentModifiedAt:  obj.UpdatedAt,
 	}
 	if err := database.DB.Create(&ver).Error; err != nil {
@@ -109,9 +137,13 @@ func versionedDeleteCurrent(backend storage.StorageBackend, bucket *models.Bucke
 		if err != nil {
 			return "", true, err
 		}
+		markerAt, err := nextVersionedAt(bucket.ID, obj.Key, archived.VersionedAt)
+		if err != nil {
+			return "", true, err
+		}
 		marker := models.ObjectVersion{
 			BucketID: bucket.ID, Key: obj.Key, VersionID: uuid.NewString(),
-			IsDeleteMarker: true, VersionedAt: time.Now(),
+			IsDeleteMarker: true, VersionedAt: markerAt,
 		}
 		generationCommitBoundary("delete")
 		err = database.DB.Transaction(func(tx *gorm.DB) error {
@@ -129,12 +161,17 @@ func versionedDeleteCurrent(backend storage.StorageBackend, bucket *models.Bucke
 	if err != nil {
 		return "", true, err
 	}
+	markerAt, err := nextVersionedAt(bucket.ID, obj.Key, time.Time{})
+	if err != nil {
+		rollbackVersionedWrite(backend, bucket, obj.Key, archivedVID)
+		return "", true, err
+	}
 	marker := models.ObjectVersion{
 		BucketID:       bucket.ID,
 		Key:            obj.Key,
 		VersionID:      uuid.New().String(),
 		IsDeleteMarker: true,
-		VersionedAt:    time.Now(),
+		VersionedAt:    markerAt,
 	}
 	if err := database.DB.Create(&marker).Error; err != nil {
 		// Undo the archive so the still-present current row keeps its bytes.

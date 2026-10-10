@@ -65,6 +65,10 @@ func commitStagedGenerationWith(backend storage.GenerationStorage, bucket *model
 // stageArchivedCurrent creates a history row without changing the current
 // row or its bytes. Legacy current bytes are copied into a generation first.
 func stageArchivedCurrent(backend storage.GenerationStorage, bucket *models.Bucket, previous *models.Object) (*models.ObjectVersion, error) {
+	versionedAt, err := nextVersionedAt(bucket.ID, previous.Key, time.Time{})
+	if err != nil {
+		return nil, err
+	}
 	oldGeneration := previous.GenerationID
 	if oldGeneration == "" {
 		legacyBackend, ok := backend.(storage.StorageBackend)
@@ -94,6 +98,6 @@ func stageArchivedCurrent(backend storage.GenerationStorage, bucket *models.Buck
 		GenerationID: oldGeneration, Size: previous.Size, ETag: previous.ETag,
 		ContentType: previous.ContentType, ContentDisposition: previous.ContentDisposition,
 		CacheControl: previous.CacheControl, Metadata: previous.Metadata, Tags: previous.Tags,
-		VersionedAt: time.Now(), ContentModifiedAt: previous.UpdatedAt,
+		VersionedAt: versionedAt, ContentModifiedAt: previous.UpdatedAt,
 	}, nil
 }

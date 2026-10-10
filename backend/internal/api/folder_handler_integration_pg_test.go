@@ -313,6 +313,11 @@ func TestIntegrationDeletedObjectsAndRestore(t *testing.T) {
 		}
 	}
 	if fmt.Sprint(keys) != "[v/ v/a v/b v/sub/c]" || all.IsTruncated {
+		var versions []models.ObjectVersion
+		_ = database.DB.Where("bucket_id = ? AND key LIKE ?", b.ID, "v/%").Order("key, versioned_at DESC, id DESC").Find(&versions).Error
+		for _, version := range versions {
+			t.Logf("version key=%q marker=%v at=%s id=%s", version.Key, version.IsDeleteMarker, version.VersionedAt.Format("2006-01-02T15:04:05.000000000Z07:00"), version.ID)
+		}
 		t.Fatalf("deleted under v/: %v (truncated=%v)", keys, all.IsTruncated)
 	}
 	if all.Objects[1].Size != int64(len("two:v/a")) {
