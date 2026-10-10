@@ -8,6 +8,7 @@ import (
 	"bkt/internal/database"
 	"bkt/internal/models"
 	"bkt/internal/services"
+	"bkt/internal/storage"
 	"bkt/internal/validation"
 
 	"github.com/gin-gonic/gin"
@@ -175,6 +176,11 @@ func (h *BucketHandler) RestoreObjectVersion(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to initialize storage"})
 		return
 	}
+	generations, ok := backend.(storage.GenerationStorage)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Storage does not support immutable generations"})
+		return
+	}
 
 	// The restored bytes become current and count against the quota.
 	reservation, qerr := reserveBucketQuota(&bucket, ver.Size)
@@ -184,36 +190,32 @@ func (h *BucketHandler) RestoreObjectVersion(c *gin.Context) {
 	}
 	defer reservation.release()
 
-	hadPrior := currentObjectExists(bucket.ID, req.Key)
-
-	// Archive the current version (if any), then copy the requested version's
-	// bytes forward: stream version -> PutObject keeps the history row intact.
-	archivedVID, verr := prepareVersionedWrite(backend, &bucket, req.Key)
-	if verr != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to version current object", Message: verr.Error()})
-		return
-	}
-	rc, err := backend.GetObjectVersion(bucket.Name, req.Key, req.VersionID)
+	// Read the exact historical generation and stage a distinct current
+	// generation. The requested history row remains untouched.
+	rc, err := getVersionBytes(backend, bucket.Name, &ver)
 	if err != nil {
-		rollbackVersionedWrite(backend, &bucket, req.Key, archivedVID)
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to read version"})
 		return
 	}
-	defer rc.Close() //nolint:errcheck // best-effort close of read stream
-	if err := backend.PutObject(bucket.Name, req.Key, rc, ver.Size, ver.ContentType, jsonPtrToMap(ver.Metadata)); err != nil {
-		rollbackVersionedWrite(backend, &bucket, req.Key, archivedVID)
-		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to restore version", Message: err.Error()})
+	body := newGuardedBody(rc, ver.Size, 0, reservation)
+	generationID := uuid.NewString()
+	_, stageErr := generations.PutGeneration(bucket.Name, req.Key, generationID, body, ver.Size, ver.ContentType, jsonPtrToMap(ver.Metadata))
+	closeErr := rc.Close()
+	if stageErr != nil || !body.Complete() || closeErr != nil {
+		if stageErr == nil {
+			_ = generations.DeleteGeneration(bucket.Name, req.Key, generationID)
+		}
+		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to restore version"})
 		return
 	}
 
 	obj := models.Object{
 		BucketID: bucket.ID, Key: req.Key, Size: ver.Size,
 		ContentType: ver.ContentType, ContentDisposition: ver.ContentDisposition,
-		CacheControl: ver.CacheControl, ETag: ver.ETag, StoragePath: req.Key,
+		CacheControl: ver.CacheControl, ETag: ver.ETag, StoragePath: req.Key, GenerationID: generationID,
 		Metadata: ver.Metadata, Tags: ver.Tags, VersionID: newCurrentVersionID(&bucket),
 	}
-	if err := upsertCurrentObject(&obj); err != nil {
-		discardFailedWrite(backend, &bucket, req.Key, archivedVID, hadPrior)
+	if err := commitStagedGeneration(generations, &bucket, &obj); err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to record restored object"})
 		return
 	}

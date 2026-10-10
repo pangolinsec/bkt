@@ -1,6 +1,7 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -63,6 +64,49 @@ func TestIntegrationGenerationPointersResolveCurrentRangeConsoleAndHistory(t *te
 	}
 	if w := itDo(s3, http.MethodGet, "/"+bucket.Name+"/key?versionId="+versionID, nil); w.Code != http.StatusOK || w.Body.String() != "history" {
 		t.Errorf("historical generation: %d %q", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegrationConsoleRestorePublishesNewGenerationAndPreservesHistory(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-restore"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) { b.Versioning = models.VersioningEnabled })
+	s3 := itS3Router(cfg, owner)
+	s3PutString(t, s3, bucket.Name, "key", "old")
+	s3PutString(t, s3, bucket.Name, "key", "new")
+	var prior models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&prior).Error; err != nil {
+		t.Fatal(err)
+	}
+	var old models.ObjectVersion
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&old).Error; err != nil {
+		t.Fatal(err)
+	}
+	console := itRouter(owner)
+	console.POST("/:name/objects/restore", NewBucketHandler(cfg).RestoreObjectVersion)
+	body := []byte(fmt.Sprintf(`{"key":"key","version_id":"%s"}`, old.VersionID))
+	if w := itDo(console, http.MethodPost, "/"+bucket.Name+"/objects/restore", body); w.Code != http.StatusOK {
+		t.Fatalf("restore: %d %s", w.Code, w.Body.String())
+	}
+	var restored models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&restored).Error; err != nil {
+		t.Fatal(err)
+	}
+	if restored.GenerationID == "" || restored.GenerationID == prior.GenerationID || restored.GenerationID == old.GenerationID {
+		t.Errorf("restore did not publish a new generation: prior=%q old=%q restored=%q", prior.GenerationID, old.GenerationID, restored.GenerationID)
+	}
+	if status, got := s3GetString(t, s3, bucket.Name, "key"); status != http.StatusOK || got != "old" {
+		t.Errorf("restored current bytes: %d %q", status, got)
+	}
+	if w := itDo(s3, http.MethodGet, "/"+bucket.Name+"/key?versionId="+old.VersionID, nil); w.Code != http.StatusOK || w.Body.String() != "old" {
+		t.Errorf("requested history changed: %d %q", w.Code, w.Body.String())
+	}
+	var archivedCurrent models.ObjectVersion
+	if err := database.DB.Where("bucket_id = ? AND key = ? AND version_id = ?", bucket.ID, "key", prior.VersionID).First(&archivedCurrent).Error; err != nil {
+		t.Fatal(err)
+	}
+	if archivedCurrent.GenerationID != prior.GenerationID {
+		t.Errorf("prior current archived pointer = %q, want %q", archivedCurrent.GenerationID, prior.GenerationID)
 	}
 }
 
