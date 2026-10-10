@@ -5,11 +5,15 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 type stalledUnlockDriver struct{ release <-chan struct{} }
+
+var stalledUnlockDriverSequence atomic.Uint64
 
 func (d stalledUnlockDriver) Open(string) (driver.Conn, error) {
 	return stalledUnlockConn{release: d.release}, nil
@@ -31,7 +35,7 @@ func (c stalledUnlockConn) QueryContext(ctx context.Context, _ string, _ []drive
 
 func TestAdvisoryUnlockHasBoundedCleanup(t *testing.T) {
 	release := make(chan struct{})
-	name := "stalled-advisory-unlock"
+	name := fmt.Sprintf("stalled-advisory-unlock-%d", stalledUnlockDriverSequence.Add(1))
 	sql.Register(name, stalledUnlockDriver{release: release})
 	db, err := sql.Open(name, "")
 	if err != nil {
