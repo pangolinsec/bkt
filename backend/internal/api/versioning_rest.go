@@ -208,6 +208,7 @@ func (h *BucketHandler) RestoreObjectVersion(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to restore version"})
 		return
 	}
+	generationCommitBoundary("restore")
 
 	obj := models.Object{
 		BucketID: bucket.ID, Key: req.Key, Size: ver.Size,

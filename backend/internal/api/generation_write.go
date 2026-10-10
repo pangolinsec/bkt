@@ -13,6 +13,11 @@ import (
 	"gorm.io/gorm"
 )
 
+// generationCommitBoundary is a no-op in production. Subprocess crash tests
+// replace it to terminate at the real storage/metadata boundary, so a route
+// refactor cannot make a diagnostic green by bypassing its old test path.
+var generationCommitBoundary = func(string) {}
+
 // commitStagedGeneration publishes an already durable, create-only blob. The
 // caller must hold the object's cross-replica key lock through this commit.
 // Staged blobs are intentionally retained on a failed/ambiguous DB commit:
@@ -33,6 +38,7 @@ func commitStagedGeneration(backend storage.GenerationStorage, bucket *models.Bu
 		if err != nil {
 			return err
 		}
+		generationCommitBoundary("archive")
 	}
 	return database.DB.Transaction(func(tx *gorm.DB) error {
 		if archived != nil {

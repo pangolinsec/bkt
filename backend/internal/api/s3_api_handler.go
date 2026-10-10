@@ -860,6 +860,7 @@ func (h *S3APIHandler) PutObject(c *gin.Context) {
 	}
 
 	// Publish the current pointer and prior-version row in one DB commit.
+	generationCommitBoundary("put")
 	object := models.Object{
 		BucketID:           bucket.ID,
 		Key:                objectKey,
@@ -1003,6 +1004,8 @@ func (h *S3APIHandler) DeleteObject(c *gin.Context) {
 			h.s3Error(c, "InternalError", "Failed to delete object from storage", objectKey, http.StatusInternalServerError)
 			return
 		}
+	} else {
+		generationCommitBoundary("delete")
 	}
 	if err := database.DB.Delete(&object).Error; err != nil {
 		h.s3Error(c, "InternalError", "Failed to delete object metadata", objectKey, http.StatusInternalServerError)
@@ -1319,6 +1322,7 @@ func (h *S3APIHandler) CopyObject(c *gin.Context, copySource string) {
 		h.s3Error(c, "InternalError", "Failed to write destination object", destKey, http.StatusInternalServerError)
 		return
 	}
+	generationCommitBoundary("copy")
 	destObj := models.Object{
 		BucketID:           destBucketModel.ID,
 		Key:                destKey,

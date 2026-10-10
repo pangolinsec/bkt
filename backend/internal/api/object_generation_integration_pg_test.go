@@ -6,19 +6,15 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
-	"strings"
 	"testing"
 
 	"bkt/internal/config"
 	"bkt/internal/database"
 	"bkt/internal/models"
-	"bkt/internal/storage"
 )
 
-// These subprocesses stop after the storage side of a current-object
-// mutation and before its metadata commit. A fresh handler must still serve
-// the last committed bytes and ETag. The tests intentionally remain red until
-// immutable generations and atomic metadata pointers cover every path.
+// These subprocesses enter real API handlers and exit at their storage/DB
+// boundary. A fresh handler must still serve the last committed bytes/ETag.
 func generationCrashChild(t *testing.T) bool {
 	t.Helper()
 	mode := os.Getenv("BKT_GENERATION_CRASH_MODE")
@@ -27,37 +23,40 @@ func generationCrashChild(t *testing.T) bool {
 	}
 	cfg := replicaConfig(t)
 	bucketName := os.Getenv("BKT_REPLICA_BUCKET")
-	backend := storage.NewLocalStorage(cfg.Storage.RootPath)
-	var err error
+	var bucket models.Bucket
+	if err := database.DB.Where("name = ?", bucketName).First(&bucket).Error; err != nil {
+		t.Fatal(err)
+	}
+	owner := models.User{ID: bucket.OwnerID, IsAdmin: true}
+	target := mode
+	if mode == "range" {
+		target = "put"
+	}
+	generationCommitBoundary = func(boundary string) {
+		if boundary == target {
+			os.Exit(79)
+		}
+	}
+	s3 := itS3Router(cfg, owner)
 	switch mode {
 	case "copy":
-		err = backend.CopyObject(bucketName, "source", "dest")
+		req := httptest.NewRequest(http.MethodPut, "/"+bucketName+"/dest", nil)
+		req.Header.Set("x-amz-copy-source", "/"+bucketName+"/source")
+		s3.ServeHTTP(httptest.NewRecorder(), req)
 	case "delete":
-		err = backend.DeleteObject(bucketName, "dest")
-	case "range":
-		err = backend.PutObject(bucketName, "dest", strings.NewReader("new-bytes"), 9, "text/plain", nil)
-	case "archive", "restore":
-		var bucket models.Bucket
-		if err = database.DB.Where("name = ?", bucketName).First(&bucket).Error; err != nil {
-			break
-		}
-		_, err = prepareVersionedWrite(backend, &bucket, "dest")
-		if err == nil && mode == "restore" {
-			versionID := os.Getenv("BKT_GENERATION_RESTORE_VERSION")
-			var rc io.ReadCloser
-			rc, err = backend.GetObjectVersion(bucketName, "dest", versionID)
-			if err == nil {
-				err = backend.PutObject(bucketName, "dest", rc, -1, "text/plain", nil)
-				_ = rc.Close()
-			}
-		}
+		s3.DELETE("/:bucket/*key", NewS3APIHandler(cfg).DeleteObject)
+		itDo(s3, http.MethodDelete, "/"+bucketName+"/dest", nil)
+	case "range", "archive":
+		itDo(s3, http.MethodPut, "/"+bucketName+"/dest", []byte("new-bytes"))
+	case "restore":
+		console := itRouter(owner)
+		console.POST("/:name/objects/restore", NewBucketHandler(cfg).RestoreObjectVersion)
+		payload := []byte(`{"key":"dest","version_id":"` + os.Getenv("BKT_GENERATION_RESTORE_VERSION") + `"}`)
+		itDo(console, http.MethodPost, "/"+bucketName+"/objects/restore", payload)
 	default:
 		t.Fatalf("unknown crash mode %q", mode)
 	}
-	if err != nil {
-		t.Fatalf("crash boundary %s: %v", mode, err)
-	}
-	os.Exit(79)
+	t.Fatalf("production %s crash boundary was not reached", mode)
 	return true
 }
 

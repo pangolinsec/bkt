@@ -113,6 +113,7 @@ func versionedDeleteCurrent(backend storage.StorageBackend, bucket *models.Bucke
 			BucketID: bucket.ID, Key: obj.Key, VersionID: uuid.NewString(),
 			IsDeleteMarker: true, VersionedAt: time.Now(),
 		}
+		generationCommitBoundary("delete")
 		err = database.DB.Transaction(func(tx *gorm.DB) error {
 			if err := tx.Create(archived).Error; err != nil {
 				return err

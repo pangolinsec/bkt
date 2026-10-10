@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,7 +16,6 @@ import (
 	"bkt/internal/database"
 	"bkt/internal/database/pgtest"
 	"bkt/internal/models"
-	"bkt/internal/storage"
 
 	"github.com/google/uuid"
 )
@@ -192,12 +190,18 @@ func TestIntegrationCrossReplicaConditionalPut(t *testing.T) {
 func TestIntegrationCrashBetweenBytesAndMetadata(t *testing.T) {
 	if os.Getenv("BKT_REPLICA_MODE") == "crash-after-bytes" {
 		cfg := replicaConfig(t)
-		bucket := os.Getenv("BKT_REPLICA_BUCKET")
-		if err := storage.NewLocalStorage(cfg.Storage.RootPath).PutObject(bucket, "crash", bytes.NewBufferString("new-bytes"), 9, "text/plain", nil); err != nil {
+		bucketName := os.Getenv("BKT_REPLICA_BUCKET")
+		var bucket models.Bucket
+		if err := database.DB.Where("name = ?", bucketName).First(&bucket).Error; err != nil {
 			t.Fatal(err)
 		}
-		// Match the PUT handler's byte-write / metadata-upsert boundary.
-		os.Exit(73)
+		generationCommitBoundary = func(boundary string) {
+			if boundary == "put" {
+				os.Exit(73)
+			}
+		}
+		itDo(itS3Router(cfg, models.User{ID: bucket.OwnerID, IsAdmin: true}), http.MethodPut, "/"+bucketName+"/crash", []byte("new-bytes"))
+		t.Fatal("production PUT crash boundary was not reached")
 	}
 	cfg := itConfig(t)
 	owner := mkUser(t, itName("crash"), "password-123", true, false)
