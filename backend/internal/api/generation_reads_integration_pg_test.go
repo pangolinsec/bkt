@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/xml"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -107,6 +108,79 @@ func TestIntegrationConsoleRestorePublishesNewGenerationAndPreservesHistory(t *t
 	}
 	if archivedCurrent.GenerationID != prior.GenerationID {
 		t.Errorf("prior current archived pointer = %q, want %q", archivedCurrent.GenerationID, prior.GenerationID)
+	}
+}
+
+func TestIntegrationUploadPartCopyReadsCommittedSourceGeneration(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-part-copy"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, nil)
+	router := itS3Router(cfg, owner)
+	s3PutString(t, router, bucket.Name, "source", "source-bytes")
+	started := itDo(router, http.MethodPost, "/"+bucket.Name+"/dest?uploads", nil)
+	if started.Code != http.StatusOK {
+		t.Fatalf("init multipart: %d %s", started.Code, started.Body.String())
+	}
+	var init InitiateMultipartUploadResult
+	if err := xml.Unmarshal(started.Body.Bytes(), &init); err != nil || init.UploadId == "" {
+		t.Fatalf("init multipart XML: %v %+v", err, init)
+	}
+	req := httptest.NewRequest(http.MethodPut, "/"+bucket.Name+"/dest?partNumber=1&uploadId="+init.UploadId, nil)
+	req.Header.Set("x-amz-copy-source", "/"+bucket.Name+"/source")
+	req.Header.Set("x-amz-copy-source-range", "bytes=0-5")
+	part := httptest.NewRecorder()
+	router.ServeHTTP(part, req)
+	if part.Code != http.StatusOK {
+		t.Fatalf("copy part from committed generation: %d %s", part.Code, part.Body.String())
+	}
+}
+
+func TestIntegrationMultipartCompletePublishesGenerationWithoutReplacingCurrent(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-multipart"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) { b.Versioning = models.VersioningEnabled })
+	router := itS3Router(cfg, owner)
+	s3PutString(t, router, bucket.Name, "key", "old")
+	var previous models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&previous).Error; err != nil {
+		t.Fatal(err)
+	}
+	started := itDo(router, http.MethodPost, "/"+bucket.Name+"/key?uploads", nil)
+	if started.Code != http.StatusOK {
+		t.Fatalf("init multipart: %d %s", started.Code, started.Body.String())
+	}
+	var init InitiateMultipartUploadResult
+	if err := xml.Unmarshal(started.Body.Bytes(), &init); err != nil || init.UploadId == "" {
+		t.Fatalf("init multipart XML: %v %+v", err, init)
+	}
+	path := "/" + bucket.Name + "/key?uploadId=" + init.UploadId
+	part := itDo(router, http.MethodPut, "/"+bucket.Name+"/key?partNumber=1&uploadId="+init.UploadId, []byte("new"))
+	if part.Code != http.StatusOK {
+		t.Fatalf("upload part: %d %s", part.Code, part.Body.String())
+	}
+	complete := []byte(fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, part.Header().Get("ETag")))
+	if w := itDo(router, http.MethodPost, path, complete); w.Code != http.StatusOK {
+		t.Fatalf("complete multipart: %d %s", w.Code, w.Body.String())
+	}
+	var current models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "key").First(&current).Error; err != nil {
+		t.Fatal(err)
+	}
+	if current.GenerationID == "" || current.GenerationID == previous.GenerationID {
+		t.Errorf("multipart did not publish a distinct current generation: before=%q after=%q", previous.GenerationID, current.GenerationID)
+	}
+	var archived models.ObjectVersion
+	if err := database.DB.Where("bucket_id = ? AND key = ? AND version_id = ?", bucket.ID, "key", previous.VersionID).First(&archived).Error; err != nil {
+		t.Fatal(err)
+	}
+	if archived.GenerationID != previous.GenerationID {
+		t.Errorf("archived pointer = %q, want %q", archived.GenerationID, previous.GenerationID)
+	}
+	if status, body := s3GetString(t, router, bucket.Name, "key"); status != http.StatusOK || body != "new" {
+		t.Errorf("multipart current bytes: %d %q", status, body)
+	}
+	if w := itDo(router, http.MethodGet, "/"+bucket.Name+"/key?versionId="+previous.VersionID, nil); w.Code != http.StatusOK || w.Body.String() != "old" {
+		t.Errorf("multipart prior bytes: %d %q", w.Code, w.Body.String())
 	}
 }
 
