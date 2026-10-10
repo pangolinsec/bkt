@@ -14,6 +14,88 @@ import (
 	"bkt/internal/models"
 )
 
+func holdBucketAdvisoryShared(t *testing.T, name string) func() {
+	t.Helper()
+	conn, err := database.AdvisoryDB.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := advisoryBucketKey(name)
+	if _, err := conn.ExecContext(context.Background(), "SELECT pg_advisory_lock_shared($1)", key); err != nil {
+		conn.Close()
+		t.Fatal(err)
+	}
+	return func() {
+		if _, err := conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock_shared($1)", key); err != nil {
+			t.Error(err)
+		}
+		if err := conn.Close(); err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+func assertBlockedUntilRelease(t *testing.T, done <-chan *httptest.ResponseRecorder, release func(), want int) {
+	t.Helper()
+	select {
+	case w := <-done:
+		release()
+		t.Fatalf("bucket config mutation bypassed an in-flight writer: %d %s", w.Code, w.Body.String())
+	case <-time.After(150 * time.Millisecond):
+	}
+	release()
+	select {
+	case w := <-done:
+		if w.Code != want {
+			t.Errorf("status %d, want %d: %s", w.Code, want, w.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("bucket config mutation did not complete")
+	}
+}
+
+func TestIntegrationSettingsWaitForObjectWriter(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("settings-lock"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) { b.Versioning = models.VersioningEnabled })
+	release := holdBucketAdvisoryShared(t, bucket.Name)
+	router := itRouter(owner)
+	router.PUT("/:name/settings", NewBucketHandler(cfg).SetBucketSettings)
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- itDo(router, http.MethodPut, "/"+bucket.Name+"/settings", []byte(`{"retention_days":30}`))
+	}()
+	assertBlockedUntilRelease(t, done, release, http.StatusOK)
+}
+
+func TestIntegrationRESTVersioningWaitsForObjectWriter(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("rest-vers-lock"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, nil)
+	release := holdBucketAdvisoryShared(t, bucket.Name)
+	router := itRouter(owner)
+	router.PUT("/:name/versioning", NewBucketHandler(cfg).SetBucketVersioning)
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- itDo(router, http.MethodPut, "/"+bucket.Name+"/versioning", []byte(`{"versioning":"enabled"}`))
+	}()
+	assertBlockedUntilRelease(t, done, release, http.StatusOK)
+}
+
+func TestIntegrationS3VersioningWaitsForObjectWriter(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("s3-vers-lock"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, nil)
+	release := holdBucketAdvisoryShared(t, bucket.Name)
+	router := itRouter(owner)
+	router.PUT("/:bucket", NewS3APIHandler(cfg).PutBucketVersioning)
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		done <- itDo(router, http.MethodPut, "/"+bucket.Name+"?versioning", []byte(`<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>`))
+	}()
+	assertBlockedUntilRelease(t, done, release, http.StatusOK)
+}
+
 type gateBody struct {
 	data    []byte
 	entered chan struct{}
