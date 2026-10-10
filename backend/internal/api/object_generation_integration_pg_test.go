@@ -91,6 +91,13 @@ func generationCrashChild(t *testing.T) bool {
 		expireCurrentObject(storage.NewLocalStorage(cfg.Storage.RootPath), &bucket, "dest", time.Now().Add(time.Minute))
 	case "replication-delete":
 		mirrorDelete(storage.NewLocalStorage(cfg.Storage.RootPath), &models.Bucket{ID: uuid.New()}, &bucket, "dest")
+	case "replication-copy":
+		var source models.Bucket
+		if err := database.DB.Where("name = ?", os.Getenv("BKT_REPLICA_SOURCE_BUCKET")).First(&source).Error; err != nil {
+			t.Fatal(err)
+		}
+		backend := storage.NewLocalStorage(cfg.Storage.RootPath)
+		replicateObject(backend, backend, &source, &bucket, "dest")
 	default:
 		t.Fatalf("unknown crash mode %q", mode)
 	}
@@ -355,6 +362,62 @@ func TestIntegrationBackgroundDeletesRetainGenerationForReaders(t *testing.T) {
 	}
 }
 
+func TestIntegrationGenerationCrashReplicationCopy(t *testing.T) {
+	if generationCrashChild(t) {
+		return
+	}
+	cfg, owner, dest, destS3 := generationFixture(t)
+	source := itBucket(t, owner.ID, nil)
+	sourceS3 := itS3Router(cfg, owner)
+	s3PutString(t, sourceS3, source.Name, "dest", "new-bytes")
+	s3PutString(t, destS3, dest.Name, "dest", "old-bytes")
+	before := itDo(destS3, http.MethodHead, "/"+dest.Name+"/dest", nil)
+	runGenerationCrashWithSource(t, cfg, dest.Name, source.Name, "replication-copy")
+	after := itDo(destS3, http.MethodGet, "/"+dest.Name+"/dest", nil)
+	if after.Code != http.StatusOK || after.Body.String() != "old-bytes" || after.Header().Get("ETag") != before.Header().Get("ETag") {
+		t.Errorf("replication copy crash exposed uncommitted bytes: status=%d body=%q ETag=%q committed ETag=%q",
+			after.Code, after.Body.String(), after.Header().Get("ETag"), before.Header().Get("ETag"))
+	}
+}
+
+func TestIntegrationReplicationCopyPublishesTargetGenerationAndHistory(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-replication-copy"), "password-123", true, false)
+	source := itBucket(t, owner.ID, nil)
+	dest := itBucket(t, owner.ID, func(b *models.Bucket) { b.Versioning = models.VersioningEnabled })
+	s3 := itS3Router(cfg, owner)
+	s3PutString(t, s3, source.Name, "dest", "new-bytes")
+	s3PutString(t, s3, dest.Name, "dest", "old-bytes")
+	var sourceRow, oldDest models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", source.ID, "dest").First(&sourceRow).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.Where("bucket_id = ? AND key = ?", dest.ID, "dest").First(&oldDest).Error; err != nil {
+		t.Fatal(err)
+	}
+	backend := storage.NewLocalStorage(cfg.Storage.RootPath)
+	if copied, busy := replicateObject(backend, backend, &source, &dest, "dest"); !copied || busy {
+		t.Fatalf("replication copy: copied=%v busy=%v", copied, busy)
+	}
+	var current models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", dest.ID, "dest").First(&current).Error; err != nil {
+		t.Fatal(err)
+	}
+	if current.GenerationID == "" || current.GenerationID == oldDest.GenerationID || current.GenerationID == sourceRow.GenerationID || current.ETag != sourceRow.ETag {
+		t.Errorf("target did not get an independent generation of source bytes: source=%+v old=%+v current=%+v", sourceRow, oldDest, current)
+	}
+	if status, body := s3GetString(t, s3, dest.Name, "dest"); status != http.StatusOK || body != "new-bytes" {
+		t.Errorf("replicated current bytes: %d %q", status, body)
+	}
+	var archived models.ObjectVersion
+	if err := database.DB.Where("bucket_id = ? AND key = ? AND version_id = ?", dest.ID, "dest", oldDest.VersionID).First(&archived).Error; err != nil || archived.GenerationID != oldDest.GenerationID {
+		t.Fatalf("replication archive: %+v %v", archived, err)
+	}
+	if w := itDo(s3, http.MethodGet, "/"+dest.Name+"/dest?versionId="+oldDest.VersionID, nil); w.Code != http.StatusOK || w.Body.String() != "old-bytes" {
+		t.Errorf("replicated target history: %d %q", w.Code, w.Body.String())
+	}
+}
+
 func TestIntegrationConsoleUploadPublishesGenerationAndHistory(t *testing.T) {
 	cfg := itConfig(t)
 	owner := mkUser(t, itName("generation-console-upload"), "password-123", true, false)
@@ -460,6 +523,14 @@ func TestIntegrationAsyncConsoleUploadPublishesGenerationAndHistory(t *testing.T
 }
 
 func runGenerationCrash(t *testing.T, cfg *config.Config, bucketName, mode, versionID string) {
+	runGenerationCrashWithSourceAndVersion(t, cfg, bucketName, "", mode, versionID)
+}
+
+func runGenerationCrashWithSource(t *testing.T, cfg *config.Config, bucketName, sourceName, mode string) {
+	runGenerationCrashWithSourceAndVersion(t, cfg, bucketName, sourceName, mode, "")
+}
+
+func runGenerationCrashWithSourceAndVersion(t *testing.T, cfg *config.Config, bucketName, sourceName, mode, versionID string) {
 	t.Helper()
 	exe, err := os.Executable()
 	if err != nil {
@@ -470,6 +541,7 @@ func runGenerationCrash(t *testing.T, cfg *config.Config, bucketName, mode, vers
 		"BKT_REPLICA_DB="+cfg.Database.DBName,
 		"BKT_REPLICA_ROOT="+cfg.Storage.RootPath,
 		"BKT_REPLICA_BUCKET="+bucketName,
+		"BKT_REPLICA_SOURCE_BUCKET="+sourceName,
 		"BKT_GENERATION_RESTORE_VERSION="+versionID)
 	cmd.Stdout, cmd.Stderr = io.Discard, io.Discard
 	if err := cmd.Run(); err == nil {

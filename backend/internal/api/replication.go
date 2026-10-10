@@ -410,12 +410,38 @@ func replicateObjectLocked(srcBackend, dstBackend storage.StorageBackend, src, d
 	}
 	defer reservation.release()
 
-	rc, err := srcBackend.GetObject(src.Name, key)
+	// The source row selects immutable bytes. Reading the public key would
+	// fail for generated objects and could copy different bytes than s.ETag.
+	rc, err := getCurrentBytes(srcBackend, src.Name, &s)
 	if err != nil {
 		logger.Warn("Replication: read failed", map[string]interface{}{"bucket": src.Name, "key": key, "error": err.Error()})
 		return false
 	}
 	defer rc.Close() //nolint:errcheck // best-effort close of read stream
+	if generations, ok := dstBackend.(storage.GenerationStorage); ok {
+		generationID := uuid.NewString()
+		info, err := generations.PutGeneration(dst.Name, key, generationID, rc, s.Size, s.ContentType, jsonPtrToMap(s.Metadata))
+		if err != nil {
+			logger.Warn("Replication: failed to stage target generation", map[string]interface{}{"bucket": dst.Name, "key": key, "error": err.Error()})
+			return false
+		}
+		if info == nil || info.Size != s.Size {
+			logger.Warn("Replication: staged target size mismatch", map[string]interface{}{"bucket": dst.Name, "key": key})
+			return false
+		}
+		obj := models.Object{
+			BucketID: dst.ID, Key: key, Size: s.Size, ContentType: s.ContentType,
+			ContentDisposition: s.ContentDisposition, CacheControl: s.CacheControl,
+			ETag: s.ETag, SHA256: s.SHA256, StoragePath: key, Metadata: s.Metadata, Tags: s.Tags,
+			GenerationID: generationID, VersionID: newCurrentVersionID(dst),
+		}
+		generationCommitBoundary("replication-copy")
+		if err := commitStagedGeneration(generations, dst, &obj); err != nil {
+			logger.Warn("Replication: failed to commit target generation", map[string]interface{}{"bucket": dst.Name, "key": key, "error": err.Error()})
+			return false
+		}
+		return true
+	}
 
 	// On a versioned target, archive the current version before the
 	// overwrite so target history (and any retained data) survives.
