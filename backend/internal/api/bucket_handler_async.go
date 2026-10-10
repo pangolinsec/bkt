@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -356,7 +357,9 @@ func (h *BucketHandler) processAsyncUpload(uploadID uuid.UUID, tempFilePath stri
 	// io.ReadSeeker, so ProgressReader stays seekable for AWS SDK retries.
 	progressReader := NewProgressReader(file, upload.ID, upload.TotalSize)
 
-	object, _, err := h.storeObject(storageBackend, &bucket, upload.ObjectKey, progressReader, upload.TotalSize, detectedType, sha256Hash)
+	lockCtx, cancelLock := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancelLock()
+	object, _, err := h.storeObject(lockCtx, storageBackend, &bucket, upload.ObjectKey, progressReader, upload.TotalSize, detectedType, sha256Hash)
 	if err != nil {
 		fail(fmt.Sprintf("Failed to store object: %v", err))
 		return

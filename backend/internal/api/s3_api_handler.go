@@ -9,6 +9,7 @@ import (
 	"bkt/internal/storage"
 	"bkt/internal/validation"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/xml"
 	"errors"
@@ -809,7 +810,7 @@ func (h *S3APIHandler) PutObject(c *gin.Context) {
 
 	// Serialize with other writers of this key: archive → write → metadata
 	// must not interleave with a concurrent overwrite or delete.
-	unlock, lockErr := lockObjectKeysChecked(bucketName, objectKey)
+	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), &bucket, objectKey)
 	if lockErr != nil {
 		h.s3Error(c, "InternalError", "Failed to lock object", objectKey, http.StatusInternalServerError)
 		return
@@ -947,7 +948,7 @@ func (h *S3APIHandler) DeleteObject(c *gin.Context) {
 	}
 
 	// Serialize with other writers of this key.
-	unlock, lockErr := lockObjectKeysChecked(bucketName, objectKey)
+	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), &bucket, objectKey)
 	if lockErr != nil {
 		h.s3Error(c, "InternalError", "Failed to lock object", objectKey, http.StatusInternalServerError)
 		return
@@ -1247,9 +1248,9 @@ func (h *S3APIHandler) CopyObject(c *gin.Context, copySource string) {
 	var unlock func()
 	var lockErr error
 	if srcBucket == destBucket {
-		unlock, lockErr = lockObjectKeysChecked(destBucket, srcKey, destKey)
+		unlock, lockErr = lockObjectKeysChecked(c.Request.Context(), &destBucketModel, srcKey, destKey)
 	} else {
-		unlock, lockErr = lockKeysAcrossBucketsChecked(srcBucket, srcKey, destBucket, destKey)
+		unlock, lockErr = lockKeysAcrossBucketsChecked(c.Request.Context(), &srcBucketModel, srcKey, &destBucketModel, destKey)
 	}
 	if lockErr != nil {
 		h.s3Error(c, "InternalError", "Failed to lock copy keys", destKey, http.StatusInternalServerError)
@@ -1461,9 +1462,9 @@ func (h *S3APIHandler) DeleteObjects(c *gin.Context) {
 		var deleted DeletedObject
 		var errEntry *DeleteError
 		if obj.VersionId != "" {
-			deleted, errEntry = h.deleteVersionForBatch(storageBackend, &bucket, obj.Key, obj.VersionId)
+			deleted, errEntry = h.deleteVersionForBatch(c.Request.Context(), storageBackend, &bucket, obj.Key, obj.VersionId)
 		} else {
-			deleted, errEntry = h.deleteOneForBatch(storageBackend, &bucket, obj.Key)
+			deleted, errEntry = h.deleteOneForBatch(c.Request.Context(), storageBackend, &bucket, obj.Key)
 		}
 		if errEntry != nil {
 			result.Errors = append(result.Errors, *errEntry)
@@ -1480,13 +1481,13 @@ func (h *S3APIHandler) DeleteObjects(c *gin.Context) {
 
 // deleteOneForBatch deletes one key for DeleteObjects under the key's write
 // lock, with the same versioning and retention rules as DeleteObject.
-func (h *S3APIHandler) deleteOneForBatch(storageBackend storage.StorageBackend, bucket *models.Bucket, key string) (DeletedObject, *DeleteError) {
+func (h *S3APIHandler) deleteOneForBatch(ctx context.Context, storageBackend storage.StorageBackend, bucket *models.Bucket, key string) (DeletedObject, *DeleteError) {
 	// S3 treats deleting a non-existent key as success; the internal version
 	// keyspace is never an object.
 	if validation.IsReservedObjectKey(key) {
 		return DeletedObject{Key: key}, nil
 	}
-	unlock, lockErr := lockObjectKeysChecked(bucket.Name, key)
+	unlock, lockErr := lockObjectKeysChecked(ctx, bucket, key)
 	if lockErr != nil {
 		return DeletedObject{}, &DeleteError{Key: key, Code: "InternalError", Message: "Failed to lock object"}
 	}
@@ -1538,11 +1539,11 @@ func deleteVersionLocked(backend storage.StorageBackend, bucket *models.Bucket, 
 
 // deleteVersionForBatch is DeleteObjects' version-addressed delete: the same
 // lock, retention rules and semantics as DELETE /{bucket}/{key}?versionId=.
-func (h *S3APIHandler) deleteVersionForBatch(backend storage.StorageBackend, bucket *models.Bucket, key, versionID string) (DeletedObject, *DeleteError) {
+func (h *S3APIHandler) deleteVersionForBatch(ctx context.Context, backend storage.StorageBackend, bucket *models.Bucket, key, versionID string) (DeletedObject, *DeleteError) {
 	if validation.IsReservedObjectKey(key) {
 		return DeletedObject{Key: key, VersionId: versionID}, nil
 	}
-	unlock, lockErr := lockObjectKeysChecked(bucket.Name, key)
+	unlock, lockErr := lockObjectKeysChecked(ctx, bucket, key)
 	if lockErr != nil {
 		return DeletedObject{}, &DeleteError{Key: key, VersionId: versionID, Code: "InternalError", Message: "Failed to lock object"}
 	}

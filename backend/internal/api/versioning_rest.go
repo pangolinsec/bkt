@@ -152,7 +152,7 @@ func (h *BucketHandler) RestoreObjectVersion(c *gin.Context) {
 
 	// Serialize with every other mutation of this key (archive + write +
 	// commit must not interleave). The versioning helpers do not lock.
-	unlock, lockErr := lockObjectKeysChecked(bucket.Name, req.Key)
+	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), &bucket, req.Key)
 	if lockErr != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to lock object"})
 		return
@@ -247,7 +247,7 @@ func (h *BucketHandler) DeleteObjectVersionREST(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to initialize storage"})
 		return
 	}
-	unlock, lockErr := lockObjectKeysChecked(bucket.Name, key)
+	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), bucket, key)
 	if lockErr != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to lock object"})
 		return

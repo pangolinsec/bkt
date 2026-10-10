@@ -244,11 +244,29 @@ func (h *S3APIHandler) PutObjectTagging(c *gin.Context) {
 		}
 		tags[t.Key] = t.Value
 	}
-	if err := database.DB.Model(obj).Updates(map[string]interface{}{
+	bucket := &models.Bucket{ID: obj.BucketID, Name: c.Param("bucket")}
+	unlock, err := lockObjectKeysChecked(c.Request.Context(), bucket, obj.Key)
+	if err != nil {
+		h.s3Error(c, "InternalError", "Failed to lock object", obj.Key, http.StatusInternalServerError)
+		return
+	}
+	defer unlock()
+	// The body was parsed outside the lock. Recheck the current row and any
+	// versionId condition now that overwrites and deletes are excluded.
+	obj, ok = h.loadObjectForTagging(c, services.ActionPutObject)
+	if !ok {
+		return
+	}
+	result := database.DB.Model(&models.Object{}).Where("id = ? AND bucket_id = ? AND key = ?", obj.ID, obj.BucketID, obj.Key).Updates(map[string]interface{}{
 		"tags":       mapToJSONPtr(tags),
 		"updated_at": time.Now(),
-	}).Error; err != nil {
+	})
+	if result.Error != nil {
 		h.s3Error(c, "InternalError", "Failed to store tags", "", http.StatusInternalServerError)
+		return
+	}
+	if result.RowsAffected != 1 {
+		h.s3Error(c, "NoSuchKey", "The specified key does not exist", obj.Key, http.StatusNotFound)
 		return
 	}
 	c.Header("x-amz-request-id", uuid.New().String())
@@ -261,11 +279,27 @@ func (h *S3APIHandler) DeleteObjectTagging(c *gin.Context) {
 	if !ok {
 		return
 	}
-	if err := database.DB.Model(obj).Updates(map[string]interface{}{
+	bucket := &models.Bucket{ID: obj.BucketID, Name: c.Param("bucket")}
+	unlock, err := lockObjectKeysChecked(c.Request.Context(), bucket, obj.Key)
+	if err != nil {
+		h.s3Error(c, "InternalError", "Failed to lock object", obj.Key, http.StatusInternalServerError)
+		return
+	}
+	defer unlock()
+	obj, ok = h.loadObjectForTagging(c, services.ActionPutObject)
+	if !ok {
+		return
+	}
+	result := database.DB.Model(&models.Object{}).Where("id = ? AND bucket_id = ? AND key = ?", obj.ID, obj.BucketID, obj.Key).Updates(map[string]interface{}{
 		"tags":       nil,
 		"updated_at": time.Now(),
-	}).Error; err != nil {
+	})
+	if result.Error != nil {
 		h.s3Error(c, "InternalError", "Failed to delete tags", "", http.StatusInternalServerError)
+		return
+	}
+	if result.RowsAffected != 1 {
+		h.s3Error(c, "NoSuchKey", "The specified key does not exist", obj.Key, http.StatusNotFound)
 		return
 	}
 	c.Header("x-amz-request-id", uuid.New().String())

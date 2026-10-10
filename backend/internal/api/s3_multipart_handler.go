@@ -346,7 +346,7 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 	}
 
 	// Serialize with other writers of the target key.
-	unlock, lockErr := lockObjectKeysChecked(mpu.BucketName, mpu.ObjectKey)
+	unlock, lockErr := lockObjectKeysChecked(c.Request.Context(), bucket, mpu.ObjectKey)
 	if lockErr != nil {
 		h.s3Error(c, "InternalError", "Failed to lock object", mpu.ObjectKey, http.StatusInternalServerError)
 		return

@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -172,5 +173,64 @@ func TestIntegrationCancelledObjectLockWait(t *testing.T) {
 	}
 	if n := objectLockEntries(); n != 1 {
 		t.Errorf("canceled waiter leaked local lock entries: %d", n)
+	}
+}
+
+func TestIntegrationCancelledPostgresAdvisoryWait(t *testing.T) {
+	itConfig(t)
+	owner := mkUser(t, itName("pg-cancel"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, nil)
+	conn, err := database.AdvisoryDB.Conn(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	key := advisoryKey(bucket.Name + "\x00wait")
+	if _, err := conn.ExecContext(context.Background(), "SELECT pg_advisory_lock($1)", key); err != nil {
+		t.Fatal(err)
+	}
+	defer conn.ExecContext(context.Background(), "SELECT pg_advisory_unlock($1)", key)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err = lockObjectKeysChecked(ctx, &bucket, "wait")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("advisory wait error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("canceled advisory wait took %v", elapsed)
+	}
+	if n := objectLockEntries(); n != 0 {
+		t.Errorf("canceled advisory wait leaked %d local lock entries", n)
+	}
+}
+
+func TestIntegrationDeleteTaggingWaitsForObjectWriter(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("untag-lock"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, nil)
+	h := NewS3APIHandler(cfg)
+	router := itRouter(owner)
+	router.PUT("/:bucket/*key", h.PutObject)
+	router.DELETE("/:bucket/*key", h.DeleteObject)
+	s3PutString(t, router, bucket.Name, "tagged", "old")
+	hold := lockObjectKeys(bucket.Name, "tagged")
+	defer hold()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- itDo(router, http.MethodDelete, "/"+bucket.Name+"/tagged?tagging", nil) }()
+	select {
+	case response := <-done:
+		hold()
+		t.Fatalf("DELETE tagging bypassed the object writer: %d", response.Code)
+	case <-time.After(100 * time.Millisecond):
+	}
+	hold()
+	select {
+	case response := <-done:
+		if response.Code != http.StatusNoContent {
+			t.Errorf("DELETE tagging status %d: %s", response.Code, response.Body.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("DELETE tagging did not complete after writer released lock")
 	}
 }
