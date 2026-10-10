@@ -213,6 +213,18 @@ func (f *fakeS3Listing) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(&sb, `<KeyCount>%d</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>`, n)
 		w.Header().Set("Content-Type", "application/xml")
 		_, _ = w.Write([]byte(sb.String()))
+	case r.Method == http.MethodDelete && strings.Count(strings.Trim(r.URL.Path, "/"), "/") == 1:
+		// A post-commit legacy cleanup must be able to remove its public key.
+		key := strings.SplitN(strings.Trim(r.URL.Path, "/"), "/", 2)[1]
+		f.mu.Lock()
+		for i, candidate := range f.keys {
+			if candidate == key {
+				f.keys = append(f.keys[:i], f.keys[i+1:]...)
+				break
+			}
+		}
+		f.mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
 	default:
 		w.WriteHeader(http.StatusNotImplemented)
 	}
@@ -336,4 +348,79 @@ func TestIntegrationListObjectsReconcilePruneSafety(t *testing.T) {
 			t.Errorf("reconciliation pruned committed generation row: %v", got)
 		}
 	})
+}
+
+func TestIntegrationDeletedLegacyS3ObjectStaysDeletedAfterConsoleList(t *testing.T) {
+	cfg := itConfig(t)
+	fake := &fakeS3Listing{keys: []string{"legacy"}}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	cfg.Storage.S3.Endpoint = strings.TrimPrefix(srv.URL, "http://")
+	cfg.Storage.S3.Region = "us-east-1"
+	cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.SecretAccessKey = "AK", "SK"
+	cfg.Storage.S3.ForcePathStyle = true
+
+	admin := mkUser(t, itName("legacy-delete"), "password-123", true, false)
+	bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+	seedRows(t, bucket.ID, time.Now().Add(-time.Hour), "legacy")
+	handler := NewBucketHandler(cfg)
+	router := itRouter(admin)
+	router.DELETE("/buckets/:name/objects/*key", handler.DeleteObject)
+	router.GET("/buckets/:name/objects", handler.ListObjects)
+
+	deleted := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name+"/objects/legacy", nil)
+	if deleted.Code != http.StatusOK {
+		t.Fatalf("delete legacy object: %d %s", deleted.Code, deleted.Body.String())
+	}
+	if got := rowKeys(t, bucket.ID); len(got) != 0 {
+		t.Fatalf("deleted object retained current metadata: %v", got)
+	}
+	listed := listObjectsKeys(t, router, bucket.Name)
+	// Reconciliation imports asynchronously; check both the response and the
+	// persistent index after it has had time to run.
+	time.Sleep(200 * time.Millisecond)
+	if len(listed) != 0 || len(rowKeys(t, bucket.ID)) != 0 {
+		t.Errorf("deleted legacy object was resurrected by console listing: listed=%v rows=%v", listed, rowKeys(t, bucket.ID))
+	}
+}
+
+func TestIntegrationDeleteBucketDoesNotCommitAfterS3StorageRefusesDeletion(t *testing.T) {
+	cfg := itConfig(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead:
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && strings.Count(strings.Trim(r.URL.Path, "/"), "/") == 1:
+			w.WriteHeader(http.StatusNoContent) // public key, not hidden generation
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusConflict) // hidden generation keeps bucket nonempty
+		default:
+			w.WriteHeader(http.StatusNotImplemented)
+		}
+	}))
+	defer upstream.Close()
+	cfg.Storage.S3.Endpoint = strings.TrimPrefix(upstream.URL, "http://")
+	cfg.Storage.S3.Region = "us-east-1"
+	cfg.Storage.S3.AccessKeyID, cfg.Storage.S3.SecretAccessKey = "AK", "SK"
+	cfg.Storage.S3.ForcePathStyle = true
+
+	admin := mkUser(t, itName("bucket-delete"), "password-123", true, false)
+	bucket := itBucket(t, admin.ID, func(b *models.Bucket) { b.StorageBackend = "s3" })
+	seedRows(t, bucket.ID, time.Now().Add(-time.Hour), "generated")
+	if err := database.DB.Model(&models.Object{}).Where("bucket_id = ? AND key = ?", bucket.ID, "generated").
+		Update("generation_id", uuid.NewString()).Error; err != nil {
+		t.Fatal(err)
+	}
+	router := itRouter(admin)
+	router.DELETE("/buckets/:name", NewBucketHandler(cfg).DeleteBucket)
+	deleted := itDo(router, http.MethodDelete, "/buckets/"+bucket.Name, nil)
+	if deleted.Code < http.StatusBadRequest {
+		t.Errorf("bucket deletion reported success despite upstream refusal: %d %s", deleted.Code, deleted.Body.String())
+	}
+	var remainingBucket, remainingObject int64
+	database.DB.Model(&models.Bucket{}).Where("id = ?", bucket.ID).Count(&remainingBucket)
+	database.DB.Model(&models.Object{}).Where("bucket_id = ?", bucket.ID).Count(&remainingObject)
+	if remainingBucket != 1 || remainingObject != 1 {
+		t.Errorf("failed bucket deletion lost metadata: buckets=%d objects=%d", remainingBucket, remainingObject)
+	}
 }
