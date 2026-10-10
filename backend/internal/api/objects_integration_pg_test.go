@@ -5,8 +5,10 @@ import (
 	"encoding/xml"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -89,6 +91,67 @@ func TestIntegrationUpsertCurrentObject(t *testing.T) {
 	database.DB.Model(&models.Object{}).Where("bucket_id = ? AND key = ?", b.ID, "race").Count(&n)
 	if n != 1 {
 		t.Errorf("%d rows for one key", n)
+	}
+}
+
+func TestIntegrationS3PutContentHeadersAndConditions(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("s3owner"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, nil)
+	router := itS3Router(cfg, owner)
+	path := "/" + bucket.Name + "/sop.md"
+	request := func(method, target, body string, headers map[string]string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, target, strings.NewReader(body))
+		for name, value := range headers {
+			req.Header.Set(name, value)
+		}
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	initial := map[string]string{
+		"Content-Type":        "text/markdown",
+		"Content-Disposition": `attachment; filename="original.md"`,
+		"Cache-Control":        "private, max-age=60",
+		"If-None-Match":       "*",
+	}
+	first := request(http.MethodPut, path, "original", initial)
+	if first.Code != http.StatusOK {
+		t.Fatalf("conditional create: %d %s", first.Code, first.Body.String())
+	}
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("missing create ETag")
+	}
+	for _, method := range []string{http.MethodHead, http.MethodGet} {
+		w := request(method, path, "", nil)
+		if w.Code != http.StatusOK || w.Header().Get("Content-Disposition") != initial["Content-Disposition"] ||
+			w.Header().Get("Cache-Control") != initial["Cache-Control"] {
+			t.Errorf("%s persisted content headers: status=%d disposition=%q cache=%q", method,
+				w.Code, w.Header().Get("Content-Disposition"), w.Header().Get("Cache-Control"))
+		}
+	}
+	if w := request(http.MethodPut, path, "duplicate", map[string]string{"If-None-Match": "*"});
+		w.Code != http.StatusPreconditionFailed {
+		t.Errorf("duplicate create: %d %s, want 412", w.Code, w.Body.String())
+	}
+	if w := request(http.MethodPut, "/"+bucket.Name+"/missing.md", "bad", map[string]string{"If-Match": etag});
+		w.Code != http.StatusPreconditionFailed {
+		t.Errorf("If-Match on missing key: %d %s, want 412", w.Code, w.Body.String())
+	}
+	if w := request(http.MethodGet, path, "", nil); w.Body.String() != "original" {
+		t.Errorf("duplicate changed original bytes: %q", w.Body.String())
+	}
+	second := request(http.MethodPut, path, "edited", map[string]string{"If-Match": etag})
+	if second.Code != http.StatusOK {
+		t.Fatalf("current If-Match: %d %s", second.Code, second.Body.String())
+	}
+	if w := request(http.MethodPut, path, "stale", map[string]string{"If-Match": etag});
+		w.Code != http.StatusPreconditionFailed {
+		t.Errorf("stale If-Match: %d %s, want 412", w.Code, w.Body.String())
+	}
+	if w := request(http.MethodGet, path, "", nil); w.Body.String() != "edited" {
+		t.Errorf("stale overwrite changed bytes: %q", w.Body.String())
 	}
 }
 

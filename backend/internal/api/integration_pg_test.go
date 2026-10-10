@@ -120,6 +120,7 @@ func itS3Router(cfg *config.Config, u models.User) *gin.Engine {
 	r.POST("/:bucket", h.HandleBucketPost)
 	r.PUT("/:bucket/*key", h.PutObject)
 	r.GET("/:bucket/*key", h.GetObject)
+	r.HEAD("/:bucket/*key", h.HeadObject)
 	return r
 }
 
