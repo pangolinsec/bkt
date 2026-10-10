@@ -436,72 +436,81 @@ func newCurrentVersionID(bucket *models.Bucket) string {
 	return ""
 }
 
-// moveObjectWithinBucket moves src to dstKey inside one bucket, preserving
-// versioning semantics: in a versioning-enabled bucket the destination gets a
-// fresh current version and the source is deleted the versioned way (bytes
-// archived + delete marker), exactly as a CopyObject + DeleteObject pair
-// would; otherwise the metadata row is re-keyed and the source bytes removed.
+// moveObjectWithinBucket stages destination bytes under a new immutable
+// generation, then changes destination and source visibility in one database
+// transaction. A versioned source also receives an archive and delete marker.
 //
 // Preconditions (caller): holds lockObjectKeys for src.Key and dstKey; has
 // verified dstKey has no current row; has applied permission and retention
-// checks. On failure it restores the previous state as far as possible.
+// checks. Failed publication leaves only an unreferenced destination stage.
 func moveObjectWithinBucket(backend storage.StorageBackend, bucket *models.Bucket, src *models.Object, dstKey string) (*models.Object, error) {
-	if err := backend.CopyObject(bucket.Name, src.Key, dstKey); err != nil {
-		return nil, fmt.Errorf("failed to copy %s: %w", src.Key, err)
+	generations, ok := backend.(storage.GenerationStorage)
+	if !ok {
+		return nil, fmt.Errorf("storage backend does not support immutable generations")
+	}
+	rc, err := getCurrentBytes(backend, bucket.Name, src)
+	if err != nil {
+		return nil, fmt.Errorf("open source %s: %w", src.Key, err)
+	}
+	generationID := uuid.NewString()
+	info, putErr := generations.PutGeneration(bucket.Name, dstKey, generationID, rc, src.Size, src.ContentType, jsonPtrToMap(src.Metadata))
+	closeErr := rc.Close()
+	if putErr != nil {
+		return nil, fmt.Errorf("stage destination %s: %w", dstKey, putErr)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close source %s: %w", src.Key, closeErr)
 	}
 	now := time.Now()
-
+	dst := models.Object{
+		BucketID: bucket.ID, Key: dstKey, Size: info.Size,
+		ContentType: src.ContentType, ContentDisposition: src.ContentDisposition,
+		CacheControl: src.CacheControl, ETag: info.ETag, SHA256: src.SHA256,
+		StoragePath: dstKey, GenerationID: generationID, Metadata: src.Metadata,
+		Tags: src.Tags, VersionID: newCurrentVersionID(bucket),
+		CreatedAt: now, UpdatedAt: now,
+	}
+	var archived *models.ObjectVersion
+	var marker *models.ObjectVersion
 	if bucket.Versioning == models.VersioningEnabled {
-		dst := models.Object{
-			BucketID:           bucket.ID,
-			Key:                dstKey,
-			Size:               src.Size,
-			ContentType:        src.ContentType,
-			ContentDisposition: src.ContentDisposition,
-			CacheControl:       src.CacheControl,
-			ETag:               src.ETag,
-			SHA256:             src.SHA256,
-			StoragePath:        dstKey,
-			Metadata:           src.Metadata,
-			Tags:               src.Tags,
-			VersionID:          uuid.New().String(),
-			CreatedAt:          now,
-			UpdatedAt:          now,
+		archived, err = stageArchivedCurrent(generations, bucket, src)
+		if err != nil {
+			return nil, fmt.Errorf("archive source %s: %w", src.Key, err)
 		}
-		if err := database.DB.Create(&dst).Error; err != nil {
-			_ = backend.DeleteObject(bucket.Name, dstKey)
-			return nil, fmt.Errorf("failed to record %s: %w", dstKey, err)
+		markerAt, err := nextVersionedAt(bucket.ID, src.Key, archived.VersionedAt)
+		if err != nil {
+			return nil, err
 		}
-		if _, _, err := versionedDeleteCurrent(backend, bucket, src); err != nil {
-			database.DB.Delete(&models.Object{}, "id = ?", dst.ID)
-			_ = backend.DeleteObject(bucket.Name, dstKey)
-			return nil, fmt.Errorf("failed to remove source %s: %w", src.Key, err)
+		marker = &models.ObjectVersion{
+			BucketID: bucket.ID, Key: src.Key, VersionID: uuid.NewString(),
+			IsDeleteMarker: true, VersionedAt: markerAt,
 		}
-		return &dst, nil
 	}
-
-	// Unversioned: re-key the row, then remove the source bytes.
-	oldKey, oldPath, oldUpdated := src.Key, src.StoragePath, src.UpdatedAt
-	res := database.DB.Model(&models.Object{}).Where("id = ? AND key = ?", src.ID, oldKey).
-		Updates(map[string]interface{}{"key": dstKey, "storage_path": dstKey, "updated_at": now})
-	if res.Error != nil || res.RowsAffected != 1 {
-		_ = backend.DeleteObject(bucket.Name, dstKey)
+	generationCommitBoundary("console-move")
+	if err := database.DB.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&dst).Error; err != nil {
+			return fmt.Errorf("publish destination %s: %w", dstKey, err)
+		}
+		if archived != nil {
+			if err := tx.Create(archived).Error; err != nil {
+				return fmt.Errorf("archive source %s: %w", src.Key, err)
+			}
+			if err := tx.Create(marker).Error; err != nil {
+				return fmt.Errorf("mark source %s deleted: %w", src.Key, err)
+			}
+		}
+		res := tx.Delete(&models.Object{}, "id = ? AND key = ?", src.ID, src.Key)
 		if res.Error != nil {
-			return nil, fmt.Errorf("failed to update metadata for %s: %w", oldKey, res.Error)
+			return res.Error
 		}
-		return nil, fmt.Errorf("source %s changed during move", oldKey)
+		if res.RowsAffected != 1 {
+			return fmt.Errorf("source %s changed during move", src.Key)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	if err := backend.DeleteObject(bucket.Name, oldKey); err != nil {
-		database.DB.Model(&models.Object{}).Where("id = ?", src.ID).
-			Updates(map[string]interface{}{"key": oldKey, "storage_path": oldPath, "updated_at": oldUpdated})
-		_ = backend.DeleteObject(bucket.Name, dstKey)
-		return nil, fmt.Errorf("failed to delete source %s: %w", oldKey, err)
-	}
-	moved := *src
-	moved.Key = dstKey
-	moved.StoragePath = dstKey
-	moved.UpdatedAt = now
-	return &moved, nil
+	return &dst, nil
 }
 
 // ── Bucket response views ────────────────────────────────────────────────────

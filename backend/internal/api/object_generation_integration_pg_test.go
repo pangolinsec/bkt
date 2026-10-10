@@ -79,6 +79,10 @@ func generationCrashChild(t *testing.T) bool {
 		consoleUpload(t, itConsoleRouter(cfg, owner), bucketName, "dest", "new-bytes")
 	case "console-delete":
 		itDo(itConsoleRouter(cfg, owner), http.MethodDelete, objectURL(bucketName, "dest"), nil)
+	case "console-move":
+		console := itConsoleRouter(cfg, owner)
+		console.POST("/api/buckets/:name/objects/move", NewBucketHandler(cfg).MoveObject)
+		itDo(console, http.MethodPost, "/api/buckets/"+bucketName+"/objects/move", []byte(`{"source_key":"source","destination_key":"dest"}`))
 	default:
 		t.Fatalf("unknown crash mode %q", mode)
 	}
@@ -184,6 +188,60 @@ func TestIntegrationConsoleDeleteRetainsGenerationForReaders(t *testing.T) {
 	defer rc.Close()
 	if bytes, err := io.ReadAll(rc); err != nil || string(bytes) != "old-bytes" {
 		t.Errorf("deleted generation lost before reader-safe reclamation: %q %v", bytes, err)
+	}
+}
+
+func TestIntegrationGenerationCrashConsoleMove(t *testing.T) {
+	if generationCrashChild(t) {
+		return
+	}
+	cfg, _, bucket, s3 := generationFixture(t)
+	s3PutString(t, s3, bucket.Name, "source", "old-bytes")
+	runGenerationCrash(t, cfg, bucket.Name, "console-move", "")
+	if status, body := s3GetString(t, s3, bucket.Name, "source"); status != http.StatusOK || body != "old-bytes" {
+		t.Errorf("console move crash lost source: %d %q", status, body)
+	}
+	if w := itDo(s3, http.MethodGet, "/"+bucket.Name+"/dest", nil); w.Code != http.StatusNotFound {
+		t.Errorf("console move crash exposed destination: %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestIntegrationConsoleMovePublishesDestinationAndSourceMarker(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-console-move"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) { b.Versioning = models.VersioningEnabled })
+	s3 := itS3Router(cfg, owner)
+	s3PutString(t, s3, bucket.Name, "source", "old-bytes")
+	var source models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "source").First(&source).Error; err != nil {
+		t.Fatal(err)
+	}
+	console := itConsoleRouter(cfg, owner)
+	console.POST("/api/buckets/:name/objects/move", NewBucketHandler(cfg).MoveObject)
+	w := itDo(console, http.MethodPost, "/api/buckets/"+bucket.Name+"/objects/move", []byte(`{"source_key":"source","destination_key":"dest"}`))
+	if w.Code != http.StatusOK {
+		t.Fatalf("console move: %d %s", w.Code, w.Body.String())
+	}
+	var dest models.Object
+	if err := database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, "dest").First(&dest).Error; err != nil {
+		t.Fatal(err)
+	}
+	if dest.GenerationID == "" || dest.GenerationID == source.GenerationID {
+		t.Errorf("destination did not get its own immutable generation: src=%q dest=%q", source.GenerationID, dest.GenerationID)
+	}
+	if status, body := s3GetString(t, s3, bucket.Name, "dest"); status != http.StatusOK || body != "old-bytes" {
+		t.Errorf("destination bytes: %d %q", status, body)
+	}
+	if w := itDo(s3, http.MethodGet, "/"+bucket.Name+"/source", nil); w.Code != http.StatusNotFound {
+		t.Errorf("moved source stayed current: %d %s", w.Code, w.Body.String())
+	}
+	var archived models.ObjectVersion
+	if err := database.DB.Where("bucket_id = ? AND key = ? AND version_id = ?", bucket.ID, "source", source.VersionID).First(&archived).Error; err != nil || archived.GenerationID != source.GenerationID {
+		t.Fatalf("source old version: %+v %v", archived, err)
+	}
+	var marker models.ObjectVersion
+	if err := database.DB.Where("bucket_id = ? AND key = ? AND is_delete_marker = ?", bucket.ID, "source", true).First(&marker).Error; err != nil || !marker.VersionedAt.After(archived.VersionedAt) {
+		t.Fatalf("source delete marker: %+v after %+v err=%v", marker, archived, err)
 	}
 }
 
