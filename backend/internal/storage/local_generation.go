@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -111,6 +112,85 @@ func (ls *LocalStorage) DeleteGeneration(bucketName, objectKey, generationID str
 		return err
 	}
 	if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// CompleteMultipartGeneration assembles parts directly into a create-only
+// generation. The public object path is never touched, including on failure.
+func (ls *LocalStorage) CompleteMultipartGeneration(bucketName, objectKey, generationID, uploadID string, parts []CompletedPart) (*ObjectInfo, error) {
+	dir, err := ls.multipartDir(uploadID)
+	if err != nil {
+		return nil, err
+	}
+	if len(parts) == 0 {
+		return nil, fmt.Errorf("cannot complete multipart upload with no parts")
+	}
+	sorted := append([]CompletedPart(nil), parts...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].PartNumber < sorted[j].PartNumber })
+	var total int64
+	for i, part := range sorted {
+		if part.PartNumber < 1 || part.PartNumber > 10000 || i > 0 && part.PartNumber == sorted[i-1].PartNumber {
+			return nil, fmt.Errorf("invalid multipart part %d", part.PartNumber)
+		}
+		info, statErr := os.Stat(filepath.Join(dir, fmt.Sprintf("part.%05d", part.PartNumber)))
+		if statErr != nil {
+			return nil, fmt.Errorf("failed to find multipart part %d: %w", part.PartNumber, statErr)
+		}
+		total += info.Size()
+	}
+	reader := &multipartConcatReader{dir: dir, parts: sorted}
+	defer reader.Close()
+	info, err := ls.PutGeneration(bucketName, objectKey, generationID, reader, total, "", nil)
+	if err != nil {
+		return nil, err
+	}
+	// Cleanup is best effort after the durable blob has been published. A
+	// staging directory left behind is handled by the abandoned-upload sweep.
+	_ = os.RemoveAll(dir)
+	return info, nil
+}
+
+type multipartConcatReader struct {
+	dir     string
+	parts   []CompletedPart
+	next    int
+	current *os.File
+}
+
+func (r *multipartConcatReader) Read(p []byte) (int, error) {
+	for {
+		if r.current == nil {
+			if r.next >= len(r.parts) {
+				return 0, io.EOF
+			}
+			path := filepath.Join(r.dir, fmt.Sprintf("part.%05d", r.parts[r.next].PartNumber))
+			f, err := os.Open(path) //nolint:gosec // fixed-format part path under validated multipart directory
+			if err != nil {
+				return 0, err
+			}
+			r.current = f
+			r.next++
+		}
+		n, err := r.current.Read(p)
+		if err != io.EOF {
+			return n, err
+		}
+		if closeErr := r.current.Close(); closeErr != nil {
+			return n, closeErr
+		}
+		r.current = nil
+		if n > 0 {
+			return n, nil
+		}
+	}
+}
+
+func (r *multipartConcatReader) Close() error {
+	if r.current != nil {
+		err := r.current.Close()
+		r.current = nil
 		return err
 	}
 	return nil

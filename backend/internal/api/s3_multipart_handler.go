@@ -390,27 +390,38 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 	}
 	defer reservation.release()
 
-	// Versioning: archive the current version before the assembled object
-	// replaces it.
-	archivedVID, verr := prepareVersionedWrite(storageBackend, bucket, mpu.ObjectKey)
-	if verr != nil {
-		h.s3Error(c, "InternalError", "Failed to version existing object", objectKey, http.StatusInternalServerError)
-		return
-	}
-
-	if err := storageBackend.CompleteMultipartUpload(mpu.BucketName, mpu.ObjectKey, uploadID, parts); err != nil {
-		rollbackVersionedWrite(storageBackend, bucket, mpu.ObjectKey, archivedVID)
-		h.s3Error(c, "InternalError", "Failed to complete multipart upload", objectKey, http.StatusInternalServerError)
-		return
-	}
-
-	// Update DB metadata. If we can't read back the assembled object, that's a
-	// real failure — undo the write rather than leaving bytes without a row.
-	objInfo, err := storageBackend.GetObjectInfo(mpu.BucketName, mpu.ObjectKey)
-	if err != nil || objInfo == nil {
-		discardFailedWrite(storageBackend, bucket, mpu.ObjectKey, archivedVID, hadPrior)
-		h.s3Error(c, "InternalError", "Failed to finalize multipart upload", objectKey, http.StatusInternalServerError)
-		return
+	var objInfo *storage.ObjectInfo
+	var generationID, archivedVID string
+	if local, ok := storageBackend.(*storage.LocalStorage); ok {
+		// Local parts live in a private staging directory. Assemble directly
+		// into immutable storage so old readers retain their selected bytes.
+		generationID = uuid.NewString()
+		objInfo, err = local.CompleteMultipartGeneration(mpu.BucketName, mpu.ObjectKey, generationID, uploadID, parts)
+		if err != nil {
+			h.s3Error(c, "InternalError", "Failed to complete multipart upload", objectKey, http.StatusInternalServerError)
+			return
+		}
+		generationCommitBoundary("multipart")
+	} else {
+		// Nonlocal multipart backends still require hidden-target initiation.
+		// Keep the legacy path until that backend's generation protocol lands.
+		var verr error
+		archivedVID, verr = prepareVersionedWrite(storageBackend, bucket, mpu.ObjectKey)
+		if verr != nil {
+			h.s3Error(c, "InternalError", "Failed to version existing object", objectKey, http.StatusInternalServerError)
+			return
+		}
+		if err := storageBackend.CompleteMultipartUpload(mpu.BucketName, mpu.ObjectKey, uploadID, parts); err != nil {
+			rollbackVersionedWrite(storageBackend, bucket, mpu.ObjectKey, archivedVID)
+			h.s3Error(c, "InternalError", "Failed to complete multipart upload", objectKey, http.StatusInternalServerError)
+			return
+		}
+		objInfo, err = storageBackend.GetObjectInfo(mpu.BucketName, mpu.ObjectKey)
+		if err != nil || objInfo == nil {
+			discardFailedWrite(storageBackend, bucket, mpu.ObjectKey, archivedVID, hadPrior)
+			h.s3Error(c, "InternalError", "Failed to finalize multipart upload", objectKey, http.StatusInternalServerError)
+			return
+		}
 	}
 
 	obj := models.Object{
@@ -422,11 +433,19 @@ func (h *S3APIHandler) CompleteMultipartUpload(c *gin.Context) {
 		CacheControl:       mpu.CacheControl,
 		ETag:               objInfo.ETag,
 		StoragePath:        mpu.ObjectKey,
+		GenerationID:       generationID,
 		Metadata:           mpu.Metadata,
 		VersionID:          newCurrentVersionID(bucket),
 	}
-	if err := upsertCurrentObject(&obj); err != nil {
-		discardFailedWrite(storageBackend, bucket, mpu.ObjectKey, archivedVID, hadPrior)
+	if generationID != "" {
+		err = commitStagedGeneration(storageBackend.(storage.GenerationStorage), bucket, &obj)
+	} else {
+		err = upsertCurrentObject(&obj)
+	}
+	if err != nil {
+		if generationID == "" {
+			discardFailedWrite(storageBackend, bucket, mpu.ObjectKey, archivedVID, hadPrior)
+		}
 		h.s3Error(c, "InternalError", "Failed to save object metadata", objectKey, http.StatusInternalServerError)
 		return
 	}

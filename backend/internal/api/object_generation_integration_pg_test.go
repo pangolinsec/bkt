@@ -1,6 +1,8 @@
 package api
 
 import (
+	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -53,11 +55,41 @@ func generationCrashChild(t *testing.T) bool {
 		console.POST("/:name/objects/restore", NewBucketHandler(cfg).RestoreObjectVersion)
 		payload := []byte(`{"key":"dest","version_id":"` + os.Getenv("BKT_GENERATION_RESTORE_VERSION") + `"}`)
 		itDo(console, http.MethodPost, "/"+bucketName+"/objects/restore", payload)
+	case "multipart":
+		start := itDo(s3, http.MethodPost, "/"+bucketName+"/dest?uploads", nil)
+		if start.Code != http.StatusOK {
+			t.Fatalf("start multipart: %d %s", start.Code, start.Body.String())
+		}
+		var upload InitiateMultipartUploadResult
+		if err := xml.Unmarshal(start.Body.Bytes(), &upload); err != nil || upload.UploadId == "" {
+			t.Fatalf("parse multipart start: %v %+v", err, upload)
+		}
+		part := itDo(s3, http.MethodPut, "/"+bucketName+"/dest?partNumber=1&uploadId="+upload.UploadId, []byte("new-bytes"))
+		if part.Code != http.StatusOK {
+			t.Fatalf("upload part: %d %s", part.Code, part.Body.String())
+		}
+		body := []byte(fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, part.Header().Get("ETag")))
+		itDo(s3, http.MethodPost, "/"+bucketName+"/dest?uploadId="+upload.UploadId, body)
 	default:
 		t.Fatalf("unknown crash mode %q", mode)
 	}
 	t.Fatalf("production %s crash boundary was not reached", mode)
 	return true
+}
+
+func TestIntegrationGenerationCrashMultipart(t *testing.T) {
+	if generationCrashChild(t) {
+		return
+	}
+	cfg, _, bucket, router := generationFixture(t)
+	s3PutString(t, router, bucket.Name, "dest", "old-bytes")
+	before := itDo(router, http.MethodHead, "/"+bucket.Name+"/dest", nil)
+	runGenerationCrash(t, cfg, bucket.Name, "multipart", "")
+	after := itDo(router, http.MethodGet, "/"+bucket.Name+"/dest", nil)
+	if after.Code != http.StatusOK || after.Body.String() != "old-bytes" || after.Header().Get("ETag") != before.Header().Get("ETag") {
+		t.Errorf("multipart crash exposed uncommitted bytes: status=%d body=%q ETag=%q committed ETag=%q",
+			after.Code, after.Body.String(), after.Header().Get("ETag"), before.Header().Get("ETag"))
+	}
 }
 
 func runGenerationCrash(t *testing.T, cfg *config.Config, bucketName, mode, versionID string) {
