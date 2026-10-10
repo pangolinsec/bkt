@@ -28,39 +28,10 @@ func commitStagedGeneration(backend storage.GenerationStorage, bucket *models.Bu
 	}
 	var archived *models.ObjectVersion
 	if priorErr == nil && bucket.Versioning == models.VersioningEnabled {
-		oldGeneration := previous.GenerationID
-		if oldGeneration == "" {
-			// A pre-migration row still names the public mutable storage slot.
-			// Copy it into an immutable generation without moving or deleting the
-			// only bytes visible to the committed current row.
-			legacyBackend, ok := backend.(storage.StorageBackend)
-			if !ok {
-				return fmt.Errorf("generation backend cannot read legacy current object")
-			}
-			rc, err := getCurrentBytes(legacyBackend, bucket.Name, &previous)
-			if err != nil {
-				return fmt.Errorf("open legacy current object: %w", err)
-			}
-			oldGeneration = uuid.NewString()
-			_, stageErr := backend.PutGeneration(bucket.Name, previous.Key, oldGeneration, rc, previous.Size, previous.ContentType, jsonPtrToMap(previous.Metadata))
-			closeErr := rc.Close()
-			if stageErr != nil {
-				return fmt.Errorf("stage legacy current object: %w", stageErr)
-			}
-			if closeErr != nil {
-				return fmt.Errorf("close legacy current object: %w", closeErr)
-			}
-		}
-		versionID := previous.VersionID
-		if versionID == "" {
-			versionID = uuid.NewString()
-		}
-		archived = &models.ObjectVersion{
-			BucketID: bucket.ID, Key: previous.Key, VersionID: versionID,
-			GenerationID: oldGeneration, Size: previous.Size, ETag: previous.ETag,
-			ContentType: previous.ContentType, ContentDisposition: previous.ContentDisposition,
-			CacheControl: previous.CacheControl, Metadata: previous.Metadata, Tags: previous.Tags,
-			VersionedAt: time.Now(), ContentModifiedAt: previous.UpdatedAt,
+		var err error
+		archived, err = stageArchivedCurrent(backend, bucket, &previous)
+		if err != nil {
+			return err
 		}
 	}
 	return database.DB.Transaction(func(tx *gorm.DB) error {
@@ -74,4 +45,40 @@ func commitStagedGeneration(backend storage.GenerationStorage, bucket *models.Bu
 		}
 		return nil
 	})
+}
+
+// stageArchivedCurrent creates a history row without changing the current
+// row or its bytes. Legacy current bytes are copied into a generation first.
+func stageArchivedCurrent(backend storage.GenerationStorage, bucket *models.Bucket, previous *models.Object) (*models.ObjectVersion, error) {
+	oldGeneration := previous.GenerationID
+	if oldGeneration == "" {
+		legacyBackend, ok := backend.(storage.StorageBackend)
+		if !ok {
+			return nil, fmt.Errorf("generation backend cannot read legacy current object")
+		}
+		rc, err := getCurrentBytes(legacyBackend, bucket.Name, previous)
+		if err != nil {
+			return nil, fmt.Errorf("open legacy current object: %w", err)
+		}
+		oldGeneration = uuid.NewString()
+		_, stageErr := backend.PutGeneration(bucket.Name, previous.Key, oldGeneration, rc, previous.Size, previous.ContentType, jsonPtrToMap(previous.Metadata))
+		closeErr := rc.Close()
+		if stageErr != nil {
+			return nil, fmt.Errorf("stage legacy current object: %w", stageErr)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close legacy current object: %w", closeErr)
+		}
+	}
+	versionID := previous.VersionID
+	if versionID == "" {
+		versionID = uuid.NewString()
+	}
+	return &models.ObjectVersion{
+		BucketID: bucket.ID, Key: previous.Key, VersionID: versionID,
+		GenerationID: oldGeneration, Size: previous.Size, ETag: previous.ETag,
+		ContentType: previous.ContentType, ContentDisposition: previous.ContentDisposition,
+		CacheControl: previous.CacheControl, Metadata: previous.Metadata, Tags: previous.Tags,
+		VersionedAt: time.Now(), ContentModifiedAt: previous.UpdatedAt,
+	}, nil
 }

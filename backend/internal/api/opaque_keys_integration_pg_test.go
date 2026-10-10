@@ -12,8 +12,7 @@ import (
 	"bkt/internal/models"
 )
 
-// itBlobPath / itVersionDir mirror the local backend's blob layout
-// (storage/local.go): objects live under the SHA-256 of the key.
+// itBlobPath / itVersionDir mirror the legacy local backend's blob layout.
 func itBlobPath(root, bucket, key string) string {
 	sum := sha256.Sum256([]byte(key))
 	h := hex.EncodeToString(sum[:])
@@ -23,6 +22,12 @@ func itBlobPath(root, bucket, key string) string {
 func itVersionDir(root, bucket, key string) string {
 	sum := sha256.Sum256([]byte(key))
 	return filepath.Join(root, ".objversions", bucket, hex.EncodeToString(sum[:]))
+}
+
+func itGenerationPath(root, bucket, key, generationID string) string {
+	sum := sha256.Sum256([]byte(key))
+	h := hex.EncodeToString(sum[:])
+	return filepath.Join(root, ".objgenerations", bucket, h[0:2], h[2:4], h, generationID)
 }
 
 // Every S3-valid key works on a local bucket through the S3 handlers — keys
@@ -59,15 +64,23 @@ func TestIntegrationS3LocalOpaqueKeys(t *testing.T) {
 		if code, body := s3GetString(t, r, b.Name, tc.urlPath); code != http.StatusOK || body != "v1:"+tc.key {
 			t.Errorf("GET %q: %d %q", tc.key, code, body)
 		}
-		if _, err := os.Stat(itBlobPath(cfg.Storage.RootPath, b.Name, tc.key)); err != nil {
-			t.Errorf("blob of %q: %v", tc.key, err)
+		row, ok := currentRow(t, b.ID, tc.key)
+		if !ok || row.GenerationID == "" {
+			t.Errorf("missing immutable generation for %q: %+v", tc.key, row)
+			continue
+		}
+		if _, err := os.Stat(itGenerationPath(cfg.Storage.RootPath, b.Name, tc.key, row.GenerationID)); err != nil {
+			t.Errorf("generation of %q: %v", tc.key, err)
+		}
+		if _, err := os.Stat(itBlobPath(cfg.Storage.RootPath, b.Name, tc.key)); !os.IsNotExist(err) {
+			t.Errorf("unexpected mutable public blob for %q: %v", tc.key, err)
 		}
 	}
 	// Nothing was written at a key-derived path: the root holds only the
 	// blob-layout trees.
 	entries, _ := os.ReadDir(cfg.Storage.RootPath)
 	for _, e := range entries {
-		if e.Name() != ".objects" && e.Name() != ".objversions" {
+		if e.Name() != ".objects" && e.Name() != ".objversions" && e.Name() != ".objgenerations" {
 			t.Errorf("unexpected entry %q in the storage root", e.Name())
 		}
 	}
@@ -82,8 +95,10 @@ func TestIntegrationS3LocalOpaqueKeys(t *testing.T) {
 	if code, body := s3GetString(t, r, b.Name, "p?versionId="+vs[0].VersionID); code != http.StatusOK || body != "v1:p" {
 		t.Errorf("GET p?versionId: %d %q", code, body)
 	}
-	if _, err := os.Stat(filepath.Join(itVersionDir(cfg.Storage.RootPath, b.Name, "p"), vs[0].VersionID)); err != nil {
-		t.Errorf("archived version bytes: %v", err)
+	if vs[0].GenerationID == "" {
+		t.Error("archived version has no immutable generation")
+	} else if _, err := os.Stat(itGenerationPath(cfg.Storage.RootPath, b.Name, "p", vs[0].GenerationID)); err != nil {
+		t.Errorf("archived generation bytes: %v", err)
 	}
 	if w := itDo(r, http.MethodDelete, "/"+b.Name+"/p/q", nil); w.Code != http.StatusNoContent {
 		t.Fatalf("DELETE p/q: %d %s", w.Code, w.Body.String())

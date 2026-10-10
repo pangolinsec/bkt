@@ -104,6 +104,26 @@ func versionedDeleteCurrent(backend storage.StorageBackend, bucket *models.Bucke
 	if bucket.Versioning != models.VersioningEnabled {
 		return "", false, nil
 	}
+	if generations, ok := backend.(storage.GenerationStorage); ok {
+		archived, err := stageArchivedCurrent(generations, bucket, obj)
+		if err != nil {
+			return "", true, err
+		}
+		marker := models.ObjectVersion{
+			BucketID: bucket.ID, Key: obj.Key, VersionID: uuid.NewString(),
+			IsDeleteMarker: true, VersionedAt: time.Now(),
+		}
+		err = database.DB.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Create(archived).Error; err != nil {
+				return err
+			}
+			if err := tx.Create(&marker).Error; err != nil {
+				return err
+			}
+			return tx.Delete(&models.Object{}, "id = ?", obj.ID).Error
+		})
+		return marker.VersionID, true, err
+	}
 	archivedVID, err := archiveCurrentVersion(backend, bucket, obj)
 	if err != nil {
 		return "", true, err
@@ -198,6 +218,9 @@ func (e *retentionError) Is(target error) bool { return target == errUnderRetent
 // Removing the current version or a latest delete marker promotes the next-
 // newest surviving version, matching S3 semantics.
 func deleteSpecificVersion(backend storage.StorageBackend, bucket *models.Bucket, key, versionID string) error {
+	if generations, ok := backend.(storage.GenerationStorage); ok {
+		return deleteSpecificVersionWithGenerations(backend, generations, bucket, key, versionID)
+	}
 	// Current version addressed by id?
 	var current models.Object
 	if database.DB.Where("bucket_id = ? AND key = ?", bucket.ID, key).First(&current).Error == nil {

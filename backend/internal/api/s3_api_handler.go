@@ -995,15 +995,16 @@ func (h *S3APIHandler) DeleteObject(c *gin.Context) {
 		return
 	}
 
-	// Delete from storage first - MUST succeed before database delete (prevents inconsistency)
-	if err := storageBackend.DeleteObject(bucketName, objectKey); err != nil {
-		h.s3Error(c, "InternalError", "Failed to delete object from storage", objectKey, http.StatusInternalServerError)
-		return
+	// The metadata row is the visibility boundary. Keep physical bytes until
+	// a reader-safe collector can prove that no committed row or live read
+	// references them.
+	if _, generationAware := storageBackend.(storage.GenerationStorage); !generationAware {
+		if err := storageBackend.DeleteObject(bucketName, objectKey); err != nil {
+			h.s3Error(c, "InternalError", "Failed to delete object from storage", objectKey, http.StatusInternalServerError)
+			return
+		}
 	}
-
-	// Delete from database only after storage delete succeeds
 	if err := database.DB.Delete(&object).Error; err != nil {
-		// Critical: storage deleted but database failed - log this for manual cleanup
 		h.s3Error(c, "InternalError", "Failed to delete object metadata", objectKey, http.StatusInternalServerError)
 		return
 	}
@@ -1232,6 +1233,11 @@ func (h *S3APIHandler) CopyObject(c *gin.Context, copySource string) {
 		h.s3Error(c, "InternalError", "Failed to initialize destination storage", destKey, http.StatusInternalServerError)
 		return
 	}
+	destGenerations, ok := destStorage.(storage.GenerationStorage)
+	if !ok {
+		h.s3Error(c, "InternalError", "Destination storage does not support immutable generations", destKey, http.StatusInternalServerError)
+		return
+	}
 
 	// Serialize with other writers of the destination, and of the source so
 	// it is read in a stable state (a concurrent overwrite/delete/archive of
@@ -1294,72 +1300,23 @@ func (h *S3APIHandler) CopyObject(c *gin.Context, copySource string) {
 	}
 	defer reservation.release()
 
-	hadPrior := currentObjectExists(destBucketModel.ID, destKey)
-
-	// Versioning: archive the destination's current version before overwrite.
-	archivedVID, verr := prepareVersionedWrite(destStorage, &destBucketModel, destKey)
-	if verr != nil {
-		h.s3Error(c, "InternalError", "Failed to version existing object", destKey, http.StatusInternalServerError)
+	// Read the exact committed source generation and stage a distinct
+	// destination generation. Self-copy follows the same path and leaves the
+	// previous current version readable until the metadata commit.
+	reader, err := getCurrentBytes(srcStorage, srcBucket, &srcObj)
+	if err != nil {
+		h.s3Error(c, "InternalError", "Failed to read source object", srcKey, http.StatusInternalServerError)
 		return
 	}
-	// Every failure before the destination bytes are written must restore the
-	// archived version.
-	writeFailed := func(code, msg, resource string) {
-		rollbackVersionedWrite(destStorage, &destBucketModel, destKey, archivedVID)
-		h.s3Error(c, code, msg, resource, http.StatusInternalServerError)
-	}
-
-	switch {
-	case sameObject && archivedVID == "":
-		// Unversioned metadata-only self-copy: the bytes are unchanged.
-	case sameObject:
-		// Versioned self-copy: the current bytes were just archived, so copy
-		// them forward from version storage as the new current version.
-		rc, err := destStorage.GetObjectVersion(destBucket, destKey, archivedVID)
-		if err != nil {
-			writeFailed("InternalError", "Failed to read source object", srcKey)
-			return
+	srcBody := newGuardedBody(reader, srcObj.Size, 0, nil)
+	generationID := uuid.NewString()
+	info, err := destGenerations.PutGeneration(destBucket, destKey, generationID, srcBody, srcObj.Size, destContentType, destMeta)
+	closeErr := reader.Close()
+	if err != nil || !srcBody.Complete() || closeErr != nil {
+		if err == nil {
+			_ = destGenerations.DeleteGeneration(destBucket, destKey, generationID)
 		}
-		perr := destStorage.PutObject(destBucket, destKey, rc, srcObj.Size, destContentType, destMeta)
-		_ = rc.Close()
-		if perr != nil {
-			writeFailed("InternalError", "Failed to write destination object", destKey)
-			return
-		}
-	case srcBucket == destBucket:
-		if err := srcStorage.CopyObject(srcBucket, srcKey, destKey); err != nil {
-			writeFailed("InternalError", "Failed to copy object", srcKey)
-			return
-		}
-	default:
-		reader, err := srcStorage.GetObject(srcBucket, srcKey)
-		if err != nil {
-			writeFailed("InternalError", "Failed to read source object", srcKey)
-			return
-		}
-		// The streamed source must be exactly srcObj.Size bytes: a short
-		// read fails the write (instead of committing a truncated copy),
-		// and so does a source longer than its metadata says.
-		src := newGuardedBody(reader, srcObj.Size, 0, nil)
-		perr := destStorage.PutObject(destBucket, destKey, src, srcObj.Size, destContentType, destMeta)
-		_ = reader.Close()
-		if perr != nil || !src.Complete() {
-			if perr == nil {
-				// The backend reported success on an unverified body.
-				discardFailedWrite(destStorage, &destBucketModel, destKey, archivedVID, hadPrior)
-				h.s3Error(c, "InternalError", "Source object length does not match its metadata", srcKey, http.StatusInternalServerError)
-				return
-			}
-			writeFailed("InternalError", "Failed to write destination object", destKey)
-			return
-		}
-	}
-
-	// Record the destination as the new current version (atomic upsert).
-	info, err := destStorage.GetObjectInfo(destBucket, destKey)
-	if err != nil {
-		discardFailedWrite(destStorage, &destBucketModel, destKey, archivedVID, hadPrior)
-		h.s3Error(c, "InternalError", "Failed to read destination object", destKey, http.StatusInternalServerError)
+		h.s3Error(c, "InternalError", "Failed to write destination object", destKey, http.StatusInternalServerError)
 		return
 	}
 	destObj := models.Object{
@@ -1372,6 +1329,7 @@ func (h *S3APIHandler) CopyObject(c *gin.Context, copySource string) {
 		ETag:               info.ETag,
 		SHA256:             srcObj.SHA256,
 		StoragePath:        destKey,
+		GenerationID:       generationID,
 		Metadata:           mapToJSONPtr(destMeta),
 		Tags:               mapToJSONPtr(destTags),
 		VersionID:          newCurrentVersionID(&destBucketModel),
@@ -1379,8 +1337,7 @@ func (h *S3APIHandler) CopyObject(c *gin.Context, copySource string) {
 	if sameObject {
 		destObj.CreatedAt = srcObj.CreatedAt
 	}
-	if err := upsertCurrentObject(&destObj); err != nil {
-		discardFailedWrite(destStorage, &destBucketModel, destKey, archivedVID, hadPrior)
+	if err := commitStagedGeneration(destGenerations, &destBucketModel, &destObj); err != nil {
 		h.s3Error(c, "InternalError", "Failed to save object metadata", destKey, http.StatusInternalServerError)
 		return
 	}
@@ -1501,8 +1458,10 @@ func (h *S3APIHandler) deleteOneForBatch(ctx context.Context, storageBackend sto
 	if retentionBlocks(bucket, dbObj.UpdatedAt) {
 		return DeletedObject{}, &DeleteError{Key: key, Code: "AccessDenied", Message: "Object is under retention"}
 	}
-	if err := storageBackend.DeleteObject(bucket.Name, key); err != nil {
-		return DeletedObject{}, &DeleteError{Key: key, Code: "InternalError", Message: "Failed to delete"}
+	if _, generationAware := storageBackend.(storage.GenerationStorage); !generationAware {
+		if err := storageBackend.DeleteObject(bucket.Name, key); err != nil {
+			return DeletedObject{}, &DeleteError{Key: key, Code: "InternalError", Message: "Failed to delete"}
+		}
 	}
 	if err := database.DB.Delete(&dbObj).Error; err != nil {
 		return DeletedObject{}, &DeleteError{Key: key, Code: "InternalError", Message: "Failed to delete object metadata"}
