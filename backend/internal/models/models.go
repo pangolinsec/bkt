@@ -179,6 +179,7 @@ type Object struct {
 	ETag               string    `json:"etag"`
 	SHA256             string    `json:"sha256,omitempty"`                     // SHA256 hash of content
 	StoragePath        string    `gorm:"not null" json:"-"`                    // Internal file system path
+	GenerationID       string    `gorm:"not null;default:''" json:"-"`         // Empty for legacy mutable current bytes
 	Metadata           *string   `gorm:"type:jsonb" json:"metadata,omitempty"` // x-amz-meta-* user metadata (JSON map, nullable)
 	Tags               *string   `gorm:"type:jsonb" json:"tags,omitempty"`     // S3 object tags (JSON map, nullable)
 	// VersionID of the CURRENT version ("" = written while unversioned, the

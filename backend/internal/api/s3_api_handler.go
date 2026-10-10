@@ -462,7 +462,7 @@ func (h *S3APIHandler) GetObject(c *gin.Context) {
 		}
 		// Native ranged read: an S3 Range GET / a file seek, rather than
 		// streaming and discarding everything before the start offset.
-		rangeReader, err := storage.GetObjectRange(storageBackend, bucketName, objectKey, start, length)
+		rangeReader, err := getCurrentRange(storageBackend, bucketName, &object, start, length)
 		if err != nil {
 			h.s3Error(c, "InternalError", "Failed to read object range", objectKey, http.StatusInternalServerError)
 			return
@@ -475,7 +475,7 @@ func (h *S3APIHandler) GetObject(c *gin.Context) {
 	}
 
 	// Get object from storage
-	file, err := storageBackend.GetObject(bucketName, objectKey)
+	file, err := getCurrentBytes(storageBackend, bucketName, &object)
 	if err != nil {
 		h.s3Error(c, "InternalError", "Failed to retrieve object", objectKey, http.StatusInternalServerError)
 		return

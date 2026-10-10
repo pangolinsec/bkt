@@ -1822,7 +1822,7 @@ func (h *BucketHandler) DownloadObject(c *gin.Context) {
 		}
 		// Native ranged read (S3 Range GET / file seek) — no streaming and
 		// discarding of the bytes before the range start.
-		rangeReader, err := storage.GetObjectRange(storageBackend, bucketName, objectKey, start, length)
+		rangeReader, err := getCurrentRange(storageBackend, bucketName, &object, start, length)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, models.ErrorResponse{Error: "Failed to read object range", Message: err.Error()})
 			return
@@ -1834,7 +1834,7 @@ func (h *BucketHandler) DownloadObject(c *gin.Context) {
 	}
 
 	// Get object from storage backend
-	file, err := storageBackend.GetObject(bucketName, objectKey)
+	file, err := getCurrentBytes(storageBackend, bucketName, &object)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResponse{
 			Error:   "Failed to retrieve object",

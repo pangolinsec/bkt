@@ -31,6 +31,7 @@ type ObjectVersion struct {
 	ContentDisposition string  `json:"content_disposition,omitempty"`
 	CacheControl       string  `json:"cache_control,omitempty"`
 	ETag               string  `json:"etag"`
+	GenerationID       string  `gorm:"not null;default:''" json:"-"` // Empty for legacy version storage
 	Metadata           *string `gorm:"type:jsonb" json:"metadata,omitempty"`
 	Tags               *string `gorm:"type:jsonb" json:"tags,omitempty"`
 	// VersionedAt is when this version STOPPED being current (archive time for

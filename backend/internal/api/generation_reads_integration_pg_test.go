@@ -1,0 +1,67 @@
+package api
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"bkt/internal/database"
+	"bkt/internal/models"
+	"bkt/internal/storage"
+
+	"github.com/google/uuid"
+)
+
+func TestIntegrationGenerationPointersResolveCurrentRangeConsoleAndHistory(t *testing.T) {
+	cfg := itConfig(t)
+	owner := mkUser(t, itName("generation-read"), "password-123", true, false)
+	bucket := itBucket(t, owner.ID, func(b *models.Bucket) { b.Versioning = models.VersioningEnabled })
+	s3 := itS3Router(cfg, owner)
+	s3PutString(t, s3, bucket.Name, "key", "legacy-old")
+	if status, body := s3GetString(t, s3, bucket.Name, "key"); status != http.StatusOK || body != "legacy-old" {
+		t.Fatalf("legacy row stopped reading: %d %q", status, body)
+	}
+	backend := storage.NewLocalStorage(cfg.Storage.RootPath)
+	currentID, historyID := uuid.NewString(), uuid.NewString()
+	currentInfo, err := backend.PutGeneration(bucket.Name, "key", currentID, strings.NewReader("new-bytes"), 9, "text/plain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	historyInfo, err := backend.PutGeneration(bucket.Name, "key", historyID, strings.NewReader("history"), 7, "text/plain", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.DB.Model(&models.Object{}).Where("bucket_id = ? AND key = ?", bucket.ID, "key").Updates(map[string]interface{}{
+		"generation_id": currentID, "e_tag": currentInfo.ETag, "size": currentInfo.Size,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	versionID := uuid.NewString()
+	if err := database.DB.Create(&models.ObjectVersion{
+		BucketID: bucket.ID, Key: "key", VersionID: versionID, GenerationID: historyID,
+		Size: historyInfo.Size, ETag: historyInfo.ETag, ContentType: "text/plain",
+		VersionedAt: time.Now(), ContentModifiedAt: time.Now(),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if status, body := s3GetString(t, s3, bucket.Name, "key"); status != http.StatusOK || body != "new-bytes" {
+		t.Errorf("current generation: %d %q", status, body)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/"+bucket.Name+"/key", nil)
+	req.Header.Set("Range", "bytes=0-2")
+	rangeResponse := httptest.NewRecorder()
+	s3.ServeHTTP(rangeResponse, req)
+	if rangeResponse.Code != http.StatusPartialContent || rangeResponse.Body.String() != "new" || rangeResponse.Header().Get("ETag") != `"`+currentInfo.ETag+`"` {
+		t.Errorf("current range: %d %q ETag=%q", rangeResponse.Code, rangeResponse.Body.String(), rangeResponse.Header().Get("ETag"))
+	}
+	console := itRouter(owner)
+	console.GET("/:name/objects/*key", NewBucketHandler(cfg).DownloadObject)
+	if w := itDo(console, http.MethodGet, "/"+bucket.Name+"/objects/key", nil); w.Code != http.StatusOK || w.Body.String() != "new-bytes" {
+		t.Errorf("console current generation: %d %q", w.Code, w.Body.String())
+	}
+	if w := itDo(s3, http.MethodGet, "/"+bucket.Name+"/key?versionId="+versionID, nil); w.Code != http.StatusOK || w.Body.String() != "history" {
+		t.Errorf("historical generation: %d %q", w.Code, w.Body.String())
+	}
+}

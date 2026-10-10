@@ -377,7 +377,7 @@ func upsertCurrentObject(obj *models.Object) error {
 		if err := tx.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "bucket_id"}, {Name: "key"}},
 			DoUpdates: clause.AssignmentColumns([]string{
-				"size", "content_type", "content_disposition", "cache_control", "e_tag", "sha256", "storage_path",
+				"size", "content_type", "content_disposition", "cache_control", "e_tag", "sha256", "storage_path", "generation_id",
 				"metadata", "tags", "version_id", "updated_at",
 			}),
 		}).Create(obj).Error; err != nil {

@@ -385,7 +385,7 @@ func (h *S3APIHandler) serveObjectVersion(c *gin.Context, bucket *models.Bucket,
 		h.s3Error(c, "InternalError", "Failed to initialize storage", objectKey, http.StatusInternalServerError)
 		return
 	}
-	rc, err := backend.GetObjectVersion(bucket.Name, objectKey, versionID)
+	rc, err := getVersionBytes(backend, bucket.Name, &ver)
 	if err != nil {
 		h.s3Error(c, "InternalError", "Failed to read version", objectKey, http.StatusInternalServerError)
 		return
